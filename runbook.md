@@ -130,7 +130,7 @@ curl -fsS -X DELETE "${BASE_URL}/api/scans/BYND" | python3 -m json.tool
 
 ## Cache operations
 
-The cache stores raw market snapshots only. Scores are recomputed on every API response.
+The cache stores raw market snapshots only. Scores are recomputed on every API response. `market_data_cache` keeps the latest raw snapshot, and `market_data_history` keeps refreshed snapshots after they age out of the 1-hour freshness window.
 
 Inspect cached raw market data:
 
@@ -144,6 +144,13 @@ Inspect one cached payload:
 ```bash
 sqlite3 "${SQUEEZE_SCANNER_CACHE_DB:-data/market_data_cache.sqlite3}" \
   "SELECT payload_json FROM market_data_cache WHERE symbol = 'BYND';"
+```
+
+Inspect retained historical snapshots:
+
+```bash
+sqlite3 "${SQUEEZE_SCANNER_CACHE_DB:-data/market_data_cache.sqlite3}" \
+  "SELECT provider, symbol, datetime(fetched_at, 'unixepoch') AS fetched_at_utc, datetime(scanned_at, 'unixepoch') AS scanned_at_utc FROM market_data_history ORDER BY fetched_at DESC LIMIT 50;"
 ```
 
 Force the next scan to refresh all market data:
@@ -176,4 +183,4 @@ for `/`, `/static/*`, and `/api/*`. If a phone still shows stale assets, force-c
 | Health works but page looks stale | Confirm reload is enabled if developing and check `curl -I "${BASE_URL}/"` for `Cache-Control: no-store`. |
 | Scan is slow | New or stale tickers require a Yahoo Finance fetch; cached tickers under 1 hour should return faster. |
 | Market data is missing | Confirm outbound internet access and try a liquid ticker such as `AAPL` or `BYND`. |
-| Cache appears wrong | Delete the ticker row from `market_data_cache`; the next scan will refresh raw data. |
+| Cache appears wrong | Delete the ticker row from `market_data_cache`; the next scan will refresh raw data while retained rows in `market_data_history` remain available for analysis. |

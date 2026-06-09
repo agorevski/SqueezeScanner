@@ -184,6 +184,81 @@ def test_cached_provider_reuses_raw_data_for_one_hour(tmp_path):
     assert third.price == 2.0
 
 
+def test_cached_provider_keeps_refreshed_raw_snapshots_in_history(tmp_path):
+    class CountingProvider:
+        def __init__(self):
+            self.calls = 0
+
+        def fetch(self, symbol):
+            self.calls += 1
+            return TickerSnapshot(symbol=symbol, price=float(self.calls))
+
+    now = [1_000.0]
+    db_path = tmp_path / "market.sqlite3"
+    cached_provider = CachedMarketDataProvider(CountingProvider(), db_path, clock=lambda: now[0])
+
+    cached_provider.fetch("BYND")
+    now[0] += 3_601
+    cached_provider.fetch("BYND")
+
+    with sqlite3.connect(db_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT fetched_at, payload_json
+            FROM market_data_history
+            WHERE symbol = 'BYND'
+            ORDER BY fetched_at
+            """
+        ).fetchall()
+
+    assert [row[0] for row in rows] == [1_000.0, 4_601.0]
+    assert [json.loads(row[1])["price"] for row in rows] == [1.0, 2.0]
+
+
+def test_cached_provider_migrates_existing_latest_cache_rows_to_history(tmp_path):
+    class StaticProvider:
+        def fetch(self, symbol):
+            return TickerSnapshot(symbol=symbol, price=11.0)
+
+    db_path = tmp_path / "market.sqlite3"
+    cached_payload = json.dumps({"symbol": "BYND", "price": 10.0, "source_warnings": []})
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE market_data_cache (
+                provider TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                fetched_at REAL NOT NULL,
+                scanned_at REAL,
+                payload_json TEXT NOT NULL,
+                PRIMARY KEY (provider, symbol)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO market_data_cache (provider, symbol, fetched_at, scanned_at, payload_json)
+            VALUES ('yahoo_finance', 'BYND', 1000.0, 1100.0, ?)
+            """,
+            (cached_payload,),
+        )
+
+    CachedMarketDataProvider(StaticProvider(), db_path).recent_snapshots(max_age_seconds=10_000)
+
+    with sqlite3.connect(db_path) as connection:
+        fetched_at, scanned_at, payload_json = connection.execute(
+            """
+            SELECT fetched_at, scanned_at, payload_json
+            FROM market_data_history
+            WHERE symbol = 'BYND'
+            """
+        ).fetchone()
+
+    assert fetched_at == 1_000.0
+    assert scanned_at == 1_100.0
+    assert json.loads(payload_json)["price"] == 10.0
+
+
 def test_cached_provider_updates_scan_time_without_refreshing_fresh_raw_data(tmp_path):
     class CountingProvider:
         def __init__(self):

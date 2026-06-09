@@ -146,6 +146,7 @@ class CachedMarketDataProvider:
                 """,
                 (self.provider_name, symbol, fetched_at, fetched_at, payload_json),
             )
+            self._write_history(connection, symbol, fetched_at, fetched_at, payload_json)
 
     def _ensure_schema(self) -> None:
         if self._schema_ready:
@@ -180,6 +181,37 @@ class CachedMarketDataProvider:
                     )
                 connection.execute(
                     """
+                    CREATE TABLE IF NOT EXISTS market_data_history (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        provider TEXT NOT NULL,
+                        symbol TEXT NOT NULL,
+                        fetched_at REAL NOT NULL,
+                        scanned_at REAL,
+                        payload_json TEXT NOT NULL,
+                        UNIQUE (provider, symbol, fetched_at)
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO market_data_history (
+                        provider,
+                        symbol,
+                        fetched_at,
+                        scanned_at,
+                        payload_json
+                    )
+                    SELECT
+                        provider,
+                        symbol,
+                        fetched_at,
+                        scanned_at,
+                        payload_json
+                    FROM market_data_cache
+                    """
+                )
+                connection.execute(
+                    """
                     CREATE INDEX IF NOT EXISTS idx_market_data_cache_fetched_at
                     ON market_data_cache (fetched_at)
                     """
@@ -188,6 +220,12 @@ class CachedMarketDataProvider:
                     """
                     CREATE INDEX IF NOT EXISTS idx_market_data_cache_scanned_at
                     ON market_data_cache (scanned_at)
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_market_data_history_provider_symbol_fetched
+                    ON market_data_history (provider, symbol, fetched_at)
                     """
                 )
 
@@ -209,6 +247,28 @@ class CachedMarketDataProvider:
                 (scanned_at, self.provider_name, symbol),
             )
 
+    def _write_history(
+        self,
+        connection: sqlite3.Connection,
+        symbol: str,
+        fetched_at: float,
+        scanned_at: float,
+        payload_json: str,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO market_data_history (
+                provider,
+                symbol,
+                fetched_at,
+                scanned_at,
+                payload_json
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (self.provider_name, symbol, fetched_at, scanned_at, payload_json),
+        )
+
 
 def snapshot_from_json(payload_json: str) -> TickerSnapshot:
     payload = json.loads(payload_json)
@@ -223,4 +283,3 @@ def snapshot_from_json(payload_json: str) -> TickerSnapshot:
         snapshot_payload["source_warnings"] = []
 
     return TickerSnapshot(**snapshot_payload)
-

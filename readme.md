@@ -11,12 +11,13 @@ This is informational only and is not financial advice.
 - Default prefill list: `INHD, MSFT, ZM, GME, AMC, CVNA, BYND, RILY`.
 - Recent screened stocks load automatically from the local cache when the page opens.
 - Search results append to the screened-stock list instead of replacing it.
+- Screened stocks can be filtered in the browser by top model, setup level, score, short interest, relative volume, and float size.
 - Trash-can controls remove a screened ticker from both the page and the local SQLite cache.
 - Signal tiles and rationale bullets are color-coded by squeeze favorability: red, orange, yellow, green.
 - Model cards include hover/tap tooltips plus a bottom-of-page model guide explaining each category and calculation.
 - Signal labels, weights, descriptions, calculations, and the color legend come from the Python scoring model API, not hard-coded HTML/JS.
 - Each ticker receives four independent 0-100 scores: Classical Short Squeeze, Float Compression, Gamma Candidate, and Hybrid.
-- Raw market data is cached in SQLite for 1 hour; model scores are always recomputed.
+- Raw market data is cached in SQLite for 1 hour; refreshed snapshots are appended to a history table and model scores are always recomputed.
 - `Cache-Control: no-store` is sent for the page, static files, and API responses to avoid stale browser assets.
 - Development server can run with Uvicorn auto-reload for `src/squeeze_scanner`.
 
@@ -99,6 +100,8 @@ The top-level `app/` package is retained only as a thin compatibility shim for o
 
 The cache stores only raw financial-service data from `TickerSnapshot` records, such as price, volume, short interest, days to cover, float shares, market cap, split history signals, and option-chain aggregates.
 
+`market_data_cache` keeps the latest raw snapshot for fast current scans. `market_data_history` keeps every refreshed raw snapshot, including records older than the 1-hour cache TTL, so historical score trends can be computed later from prior raw data.
+
 Each row also stores timestamps:
 
 - `fetched_at`: when raw market data was last refreshed from Yahoo Finance.
@@ -115,7 +118,8 @@ It does **not** cache:
 Defaults are configured in `.env.example`:
 
 - database: `data/market_data_cache.sqlite3`
-- table: `market_data_cache`
+- latest table: `market_data_cache`
+- history table: `market_data_history`
 - refresh interval: `3600` seconds
 
 ## Scoring models
@@ -140,7 +144,7 @@ The frontend reads this metadata from `GET /api/model` and from the `model` bloc
 | `GET` | `/` | Website front-end |
 | `GET` | `/api/health` | Health check |
 | `GET` | `/api/model` | Current scoring model metadata used by the UI legend and tooltips |
-| `GET` | `/api/scans/recent` | Scores tickers screened within the last hour from cached raw snapshots |
+| `GET` | `/api/scans/recent` | Scores tickers screened within the last hour from latest cached raw snapshots |
 | `DELETE` | `/api/scans/{symbol}` | Deletes one ticker from the local cache so it disappears from the current UX |
 | `POST` | `/api/scan` | Scans requested tickers, using cached raw data unless stale |
 | `POST` | `/api/scan/most-shorted?count=100` | Loads Yahoo's predefined most-shorted universe and analyzes those tickers |

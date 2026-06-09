@@ -43,6 +43,56 @@
       </section>
 
       <section id="status" class="status" aria-live="polite"></section>
+      <section class="panel filter-panel" aria-labelledby="filters-title">
+        <div class="filter-heading">
+          <div>
+            <h2 id="filters-title">Filter screened stocks</h2>
+            <p class="hint">
+              Narrow the visible table without removing scanned stocks from the page or cache.
+            </p>
+          </div>
+          <button id="clear-filters" class="secondary-button" type="button">Clear filters</button>
+        </div>
+        <div class="filter-grid">
+          <label for="filter-search">
+            <span>Symbol or company</span>
+            <input id="filter-search" type="search" placeholder="BYND or GameStop" autocomplete="off" />
+          </label>
+          <label for="filter-model">
+            <span>Top model</span>
+            <select id="filter-model">
+              <option value="">Any top model</option>
+            </select>
+          </label>
+          <label for="filter-risk">
+            <span>Setup</span>
+            <select id="filter-risk">
+              <option value="">Any setup</option>
+              <option value="High setup">High setup</option>
+              <option value="Watchlist">Watchlist</option>
+              <option value="Emerging">Emerging</option>
+              <option value="Low">Low</option>
+            </select>
+          </label>
+          <label for="filter-min-score">
+            <span>Min top score</span>
+            <input id="filter-min-score" type="number" min="0" max="100" step="1" placeholder="50" />
+          </label>
+          <label for="filter-min-short-float">
+            <span>Min short % float</span>
+            <input id="filter-min-short-float" type="number" min="0" step="0.1" placeholder="20" />
+          </label>
+          <label for="filter-min-relative-volume">
+            <span>Min relative volume</span>
+            <input id="filter-min-relative-volume" type="number" min="0" step="0.1" placeholder="2" />
+          </label>
+          <label for="filter-max-float">
+            <span>Max float (M shares)</span>
+            <input id="filter-max-float" type="number" min="0" step="0.1" placeholder="50" />
+          </label>
+        </div>
+        <p id="filter-status" class="filter-status">Filters apply after stocks are screened.</p>
+      </section>
       <section id="summary" class="summary-grid"></section>
       <section id="results" class="results"></section>
 

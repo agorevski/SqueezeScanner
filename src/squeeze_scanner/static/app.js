@@ -4,6 +4,24 @@ const mostShortedButton = document.querySelector("#most-shorted-button");
 const statusEl = document.querySelector("#status");
 const resultsEl = document.querySelector("#results");
 const summaryEl = document.querySelector("#summary");
+const filterStatusEl = document.querySelector("#filter-status");
+const filterSearchEl = document.querySelector("#filter-search");
+const filterModelEl = document.querySelector("#filter-model");
+const filterRiskEl = document.querySelector("#filter-risk");
+const filterMinScoreEl = document.querySelector("#filter-min-score");
+const filterMinShortFloatEl = document.querySelector("#filter-min-short-float");
+const filterMinRelativeVolumeEl = document.querySelector("#filter-min-relative-volume");
+const filterMaxFloatEl = document.querySelector("#filter-max-float");
+const clearFiltersButton = document.querySelector("#clear-filters");
+const filterControls = [
+  filterSearchEl,
+  filterModelEl,
+  filterRiskEl,
+  filterMinScoreEl,
+  filterMinShortFloatEl,
+  filterMinRelativeVolumeEl,
+  filterMaxFloatEl,
+].filter(Boolean);
 
 const screenedResults = new Map();
 
@@ -58,6 +76,18 @@ document.addEventListener("keydown", (event) => {
   document
     .querySelectorAll(".has-tooltip.tooltip-open")
     .forEach((element) => element.classList.remove("tooltip-open"));
+});
+
+filterControls.forEach((control) => {
+  control.addEventListener("input", renderScreenedResults);
+  control.addEventListener("change", renderScreenedResults);
+});
+
+clearFiltersButton?.addEventListener("click", () => {
+  filterControls.forEach((control) => {
+    control.value = "";
+  });
+  renderScreenedResults();
 });
 
 form.addEventListener("submit", async (event) => {
@@ -179,6 +209,28 @@ function applyModelMetadata(model) {
     ]),
   );
   modelOrder = model.models.map((scoringModel) => scoringModel.key);
+  renderModelFilterOptions();
+}
+
+function renderModelFilterOptions() {
+  if (!filterModelEl || !modelOrder.length) {
+    return;
+  }
+
+  const currentValue = filterModelEl.value;
+  filterModelEl.innerHTML = `
+    <option value="">Any top model</option>
+    ${modelOrder
+      .map((key) => {
+        const definition = modelDefinition(key);
+        return `<option value="${escapeHtml(key)}">${escapeHtml(definition.label)}</option>`;
+      })
+      .join("")}
+  `;
+
+  if ([...filterModelEl.options].some((option) => option.value === currentValue)) {
+    filterModelEl.value = currentValue;
+  }
 }
 
 async function fetchJson(url, options = {}) {
@@ -227,13 +279,15 @@ function sortedScreenedResults() {
 }
 
 function renderScreenedResults() {
-  const results = sortedScreenedResults();
-  renderSummary(results);
-  renderResults(results);
+  const allResults = sortedScreenedResults();
+  const visibleResults = filterScreenedResults(allResults);
+  renderSummary(visibleResults, allResults.length);
+  renderFilterStatus(visibleResults.length, allResults.length);
+  renderResults(visibleResults, allResults.length);
 }
 
-function renderSummary(results) {
-  if (!results.length) {
+function renderSummary(results, totalCount) {
+  if (!totalCount) {
     summaryEl.innerHTML = "";
     return;
   }
@@ -247,7 +301,7 @@ function renderSummary(results) {
   const best = results[0];
 
   summaryEl.innerHTML = `
-    ${summaryCard("Screened", results.length)}
+    ${summaryCard("Showing", `${results.length}/${totalCount}`)}
     ${summaryCard("High setups", highCount)}
     ${summaryCard("Watchlist", watchCount)}
     ${summaryCard("Top score", best ? `${best.symbol} ${best.score}` : "None")}
@@ -263,9 +317,112 @@ function summaryCard(label, value) {
   `;
 }
 
-function renderResults(results) {
+function filterScreenedResults(results) {
+  const filters = currentFilters();
+  return results.filter((result) => matchesFilters(result, filters));
+}
+
+function currentFilters() {
+  const maxFloatMillions = numberFilterValue(filterMaxFloatEl);
+  return {
+    search: (filterSearchEl?.value || "").trim().toUpperCase(),
+    model: filterModelEl?.value || "",
+    risk: filterRiskEl?.value || "",
+    minScore: numberFilterValue(filterMinScoreEl),
+    minShortFloat: numberFilterValue(filterMinShortFloatEl),
+    minRelativeVolume: numberFilterValue(filterMinRelativeVolumeEl),
+    maxFloatShares: maxFloatMillions === null ? null : maxFloatMillions * 1_000_000,
+  };
+}
+
+function numberFilterValue(element) {
+  if (!element || element.value.trim() === "") {
+    return null;
+  }
+
+  const value = Number(element.value);
+  return Number.isFinite(value) ? value : null;
+}
+
+function matchesFilters(result, filters) {
+  const metrics = result.metrics || {};
+  const searchableText = `${result.symbol} ${result.company_name || ""}`.toUpperCase();
+
+  if (filters.search && !searchableText.includes(filters.search)) {
+    return false;
+  }
+  if (filters.model && result.primary_model !== filters.model) {
+    return false;
+  }
+  if (filters.risk && result.risk_level !== filters.risk) {
+    return false;
+  }
+  if (!meetsMinimum(result.score, filters.minScore)) {
+    return false;
+  }
+  if (!meetsMinimum(metrics.short_percent_float, filters.minShortFloat)) {
+    return false;
+  }
+  if (!meetsMinimum(metrics.relative_volume, filters.minRelativeVolume)) {
+    return false;
+  }
+  if (!meetsMaximum(metrics.float_shares, filters.maxFloatShares)) {
+    return false;
+  }
+
+  return true;
+}
+
+function meetsMinimum(value, minimum) {
+  if (minimum === null) {
+    return true;
+  }
+
+  return typeof value === "number" && value >= minimum;
+}
+
+function meetsMaximum(value, maximum) {
+  if (maximum === null) {
+    return true;
+  }
+
+  return typeof value === "number" && value <= maximum;
+}
+
+function renderFilterStatus(visibleCount, totalCount) {
+  if (!filterStatusEl) {
+    return;
+  }
+
+  if (!totalCount) {
+    filterStatusEl.textContent = "Filters apply after stocks are screened.";
+    return;
+  }
+
+  const filters = currentFilters();
+  const active = hasActiveFilters(filters);
+  filterStatusEl.textContent = active
+    ? `Showing ${visibleCount} of ${totalCount} screened stock${totalCount === 1 ? "" : "s"}.`
+    : `Showing all ${totalCount} screened stock${totalCount === 1 ? "" : "s"}.`;
+}
+
+function hasActiveFilters(filters) {
+  return Boolean(
+    filters.search ||
+      filters.model ||
+      filters.risk ||
+      filters.minScore !== null ||
+      filters.minShortFloat !== null ||
+      filters.minRelativeVolume !== null ||
+      filters.maxFloatShares !== null,
+  );
+}
+
+function renderResults(results, totalCount) {
   if (!results.length) {
-    resultsEl.innerHTML = "";
+    resultsEl.innerHTML = totalCount
+      ? `<div class="panel empty-results">No screened stocks match the current filters.</div>`
+      : "";
     return;
   }
 

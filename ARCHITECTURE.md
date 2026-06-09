@@ -18,7 +18,7 @@ flowchart LR
     API --> Scanner
     Scanner --> CacheProvider
     API -->|"recent cached snapshots"| CacheProvider
-    CacheProvider --> SQLite[("SQLite<br/>data/market_data_cache.sqlite3<br/>raw snapshots only")]
+    CacheProvider --> SQLite[("SQLite<br/>data/market_data_cache.sqlite3<br/>latest raw snapshots<br/>historical raw snapshots")]
     CacheProvider -->|"cache miss or >1 hr stale"| YahooProvider
     YahooProvider --> Yahoo["Yahoo Finance<br/>market data"]
 ```
@@ -47,7 +47,7 @@ sequenceDiagram
     else missing or older than 1 hour
         Cache->>Yahoo: Fetch quote, short interest, volume, history
         Yahoo-->>Cache: Raw market data
-        Cache->>Cache: Store raw TickerSnapshot only
+        Cache->>Cache: Store latest raw TickerSnapshot and append history
         Cache-->>Scanner: Fresh TickerSnapshot
     end
     Scanner->>Scanner: Recompute four independent squeeze model scores
@@ -75,7 +75,8 @@ sequenceDiagram
 - Uvicorn auto-reload can watch `src/squeeze_scanner` during development.
 - Browser, static, and API responses use `Cache-Control: no-store` to prevent stale UI assets.
 - The frontend gets model definitions, signal labels, weights, descriptions, calculations, tooltips, and legend data from the Python scoring model via `/api/model` and each response `model` block.
-- SQLite stores raw financial-service snapshots plus `fetched_at` and `scanned_at` timestamps. Scores, risk labels, components, rationale, and rendered UI state are never cached.
+- The frontend keeps scanned results in memory and applies model/indicator filters client-side, so filtering changes only the visible table/cards and does not delete cached data.
+- SQLite stores latest raw financial-service snapshots plus historical raw snapshots with `fetched_at` and `scanned_at` timestamps. Scores, risk labels, components, rationale, and rendered UI state are never cached.
 - `/api/scans/recent` returns all tickers screened within the current TTL and recomputes their scores with the current model.
 - `DELETE /api/scans/{symbol}` removes one ticker from the SQLite cache; the frontend also removes it from the visible screened list.
 - `/api/scan` uses cached raw data for fresh symbols and fetches Yahoo Finance only for new or stale symbols.

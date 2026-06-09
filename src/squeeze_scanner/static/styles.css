@@ -97,13 +97,15 @@ label {
 }
 
 input,
+select,
 button {
   border: 0;
   border-radius: 14px;
   font: inherit;
 }
 
-input {
+input,
+select {
   min-width: 0;
   padding: 16px 18px;
   background: #0b1424;
@@ -111,8 +113,13 @@ input {
   outline: 1px solid var(--border);
 }
 
-input:focus {
+input:focus,
+select:focus {
   outline-color: var(--accent-strong);
+}
+
+select {
+  appearance: none;
 }
 
 button {
@@ -162,6 +169,52 @@ button:disabled {
 
 .hint {
   margin: 10px 0 0;
+  font-size: 0.92rem;
+}
+
+.filter-panel {
+  margin: 18px 0 0;
+}
+
+.filter-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: start;
+  margin-bottom: 16px;
+}
+
+.filter-heading h2 {
+  margin: 0;
+}
+
+.filter-heading button {
+  padding: 12px 18px;
+}
+
+.filter-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.filter-grid label {
+  margin: 0;
+}
+
+.filter-grid span {
+  display: block;
+  margin-bottom: 8px;
+}
+
+.filter-grid input,
+.filter-grid select {
+  width: 100%;
+}
+
+.filter-status {
+  margin: 14px 0 0;
+  color: var(--muted);
   font-size: 0.92rem;
 }
 
@@ -275,6 +328,11 @@ tr:last-child td {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 16px;
   margin-top: 16px;
+}
+
+.empty-results {
+  padding: 22px;
+  color: var(--muted);
 }
 
 .result-card {
@@ -585,9 +643,15 @@ tr:last-child td {
 
 @media (max-width: 820px) {
   .input-row,
+  .filter-heading,
+  .filter-grid,
   .summary-grid,
   .cards {
     grid-template-columns: 1fr;
+  }
+
+  .filter-heading {
+    display: grid;
   }
 
   button {

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from typing import List, Union
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -22,6 +23,8 @@ from .scanner import (
 )
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BASE_DIR / ".env")
+
 CACHE_DB_PATH = Path(os.getenv("SQUEEZE_SCANNER_CACHE_DB", BASE_DIR / "data" / "market_data_cache.sqlite3"))
 CACHE_TTL_SECONDS = int(os.getenv("SQUEEZE_SCANNER_CACHE_TTL_SECONDS", str(DEFAULT_CACHE_TTL_SECONDS)))
 

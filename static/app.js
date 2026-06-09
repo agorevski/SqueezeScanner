@@ -219,13 +219,13 @@ function renderResults(results) {
             <th>Symbol</th>
             <th>Score</th>
             <th>Setup</th>
-            <th>Scanned</th>
             <th>Price</th>
             <th>Short % Float</th>
             <th>Days Cover</th>
             <th>Rel Vol</th>
             <th>5D</th>
             <th>Float</th>
+            <th>Scanned</th>
           </tr>
         </thead>
         <tbody>
@@ -249,13 +249,13 @@ function renderResultRow(result) {
       </td>
       <td><strong>${formatNumber(result.score)}</strong></td>
       <td><span class="badge ${badgeClass(result.risk_level)}">${escapeHtml(result.risk_level)}</span></td>
-      <td>${formatScanAge(result.minutes_since_scan)}</td>
       <td>${formatCurrency(metrics.price)}</td>
       <td>${formatPercent(metrics.short_percent_float)}</td>
       <td>${formatNumber(metrics.short_ratio)}</td>
       <td>${formatMultiple(metrics.relative_volume)}</td>
       <td class="${trendClass(metrics.change_5d_pct)}">${formatSignedPercent(metrics.change_5d_pct)}</td>
       <td>${formatCompact(metrics.float_shares)}</td>
+      <td>${formatScanAge(result.minutes_since_scan)}</td>
     </tr>
   `;
 }

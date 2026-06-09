@@ -2,8 +2,8 @@
 
 ```mermaid
 flowchart LR
-    Phone["Phone / browser<br/>Tailnet client"] -->|HTTP :7890| Tailnet["Tailscale<br/>100.126.90.82"]
-    Tailnet --> Uvicorn["Uvicorn<br/>FastAPI app"]
+    Phone["Phone / browser"] -->|HTTP configured port| Network["Configured host/IP<br/>from .env"]
+    Network --> Uvicorn["Uvicorn<br/>FastAPI app"]
 
     subgraph WebApp["SqueezeScanner application"]
         UI["HTML/CSS/JS<br/>templates + static"]
@@ -58,7 +58,7 @@ sequenceDiagram
 ## Key design points
 
 - `uv` manages dependencies and the `squeeze-scanner` console script.
-- The service listens on port `7890`; this host is reached through Tailscale at `100.126.90.82`.
+- Network binding, port, reload mode, cache path, and cache TTL are configured through `.env`; `.env.example` documents the supported variables.
 - Uvicorn auto-reload can watch `app/`, `templates/`, and `static/` during development.
 - Browser, static, and API responses use `Cache-Control: no-store` to prevent stale UI assets.
 - The frontend gets signal labels, weights, descriptions, calculations, tooltips, and legend data from the Python scoring model via `/api/model` and each response `model` block.

@@ -2,18 +2,12 @@
 
 A Python/FastAPI website for screening potential short squeeze setups using live Yahoo Finance data through `yfinance`.
 
-The app is currently designed to run on the Tailscale address:
-
-```text
-http://100.126.90.82:7890/
-```
-
 This is informational only and is not financial advice.
 
 ## Features
 
 - Browser UI for scanning comma-, space-, or semicolon-separated ticker symbols.
-- Default prefill list: `INHD, GME, AMC, CVNA, BYND, RILY`.
+- Default prefill list: `INHD, MSFT, ZM, GME, AMC, CVNA, BYND, RILY`.
 - Recent screened stocks load automatically from the local cache when the page opens.
 - Search results append to the screened-stock list instead of replacing it.
 - Signal tiles and rationale bullets are color-coded by squeeze favorability: red, orange, yellow, green.
@@ -28,44 +22,60 @@ This is informational only and is not financial advice.
 - Python 3.11+
 - [`uv`](https://docs.astral.sh/uv/)
 - Network access to Yahoo Finance
-- Tailscale access to `100.126.90.82`
+- Optional: Tailscale if exposing the site to a tailnet
 
 ## Setup
 
 ```bash
 uv sync
+cp .env.example .env
 ```
 
-## Run
+Edit `.env` for your machine. The checked-in `.env.example` lists all supported runtime variables:
 
-Standard launch:
+| Variable | Purpose |
+| --- | --- |
+| `SQUEEZE_SCANNER_HOST` | Host/IP for Uvicorn to bind, such as `127.0.0.1`, `0.0.0.0`, or a Tailscale IP. |
+| `SQUEEZE_SCANNER_PORT` | Port for the website. |
+| `SQUEEZE_SCANNER_RELOAD` | Set to `true` to enable Uvicorn reload through the console script. |
+| `SQUEEZE_SCANNER_CACHE_DB` | Repository-relative or absolute path to the SQLite raw market data cache. |
+| `SQUEEZE_SCANNER_CACHE_TTL_SECONDS` | Raw market data freshness window before a ticker is refreshed. |
+
+## Run
 
 ```bash
 uv run squeeze-scanner
 ```
 
-Defaults:
+The app automatically loads `.env` from the repository root. Visit:
 
-- host: `0.0.0.0`
-- port: `7890`
-
-Host-specific Tailscale launch:
-
-```bash
-SQUEEZE_SCANNER_HOST=100.126.90.82 SQUEEZE_SCANNER_PORT=7890 uv run squeeze-scanner
+```text
+http://<SQUEEZE_SCANNER_HOST>:<SQUEEZE_SCANNER_PORT>/
 ```
 
-Reload-enabled launch used during development:
+For local development with source auto-reload, set this in `.env`:
+
+```dotenv
+SQUEEZE_SCANNER_RELOAD=true
+```
+
+Then run the same command:
+
+```bash
+uv run squeeze-scanner
+```
+
+If you prefer invoking Uvicorn directly:
 
 ```bash
 uv run uvicorn app.main:app \
-  --app-dir /home/algore/GIT/agorevski/SqueezeScanner \
-  --host 100.126.90.82 \
-  --port 7890 \
+  --app-dir . \
+  --host "${SQUEEZE_SCANNER_HOST:-127.0.0.1}" \
+  --port "${SQUEEZE_SCANNER_PORT:-7890}" \
   --reload \
-  --reload-dir /home/algore/GIT/agorevski/SqueezeScanner/app \
-  --reload-dir /home/algore/GIT/agorevski/SqueezeScanner/templates \
-  --reload-dir /home/algore/GIT/agorevski/SqueezeScanner/static
+  --reload-dir app \
+  --reload-dir templates \
+  --reload-dir static
 ```
 
 ## Market data cache
@@ -85,19 +95,11 @@ It does **not** cache:
 - rationale
 - rendered results
 
-Defaults:
+Defaults are configured in `.env.example`:
 
 - database: `data/market_data_cache.sqlite3`
 - table: `market_data_cache`
 - refresh interval: `3600` seconds
-
-Configuration:
-
-```bash
-SQUEEZE_SCANNER_CACHE_DB=/path/to/market_data_cache.sqlite3 \
-SQUEEZE_SCANNER_CACHE_TTL_SECONDS=3600 \
-uv run squeeze-scanner
-```
 
 ## Scoring model
 
@@ -129,7 +131,7 @@ The frontend reads this metadata from `GET /api/model` and from the `model` bloc
 Example:
 
 ```bash
-curl -X POST http://100.126.90.82:7890/api/scan \
+curl -X POST "http://${SQUEEZE_SCANNER_HOST:-127.0.0.1}:${SQUEEZE_SCANNER_PORT:-7890}/api/scan" \
   -H 'Content-Type: application/json' \
   -d '{"symbols":"INHD, BYND"}'
 ```
@@ -141,3 +143,4 @@ uv run pytest
 ```
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the component diagram and data flow.
+

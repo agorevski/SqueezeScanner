@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Short Squeeze Scanner</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <p class="eyebrow">Market scanner</p>
+        <h1>Short Squeeze Scanner</h1>
+        <p class="hero-copy">
+          Rank tickers by short interest, days to cover, relative volume, momentum,
+          float pressure, and short-interest trend.
+        </p>
+      </section>
+
+      <section class="panel">
+        <form id="scan-form" class="scan-form">
+          <label for="symbols">Ticker symbols</label>
+          <div class="input-row">
+            <input
+              id="symbols"
+              name="symbols"
+              type="text"
+              value="INHD, GME, AMC, CVNA, BYND, RILY"
+              placeholder="GME, AMC, CVNA"
+              autocomplete="off"
+              required
+            />
+            <button id="scan-button" type="submit">Scan</button>
+          </div>
+          <p class="hint">Separate up to 25 tickers with commas, spaces, or semicolons.</p>
+        </form>
+      </section>
+
+      <section id="status" class="status" aria-live="polite"></section>
+      <section id="summary" class="summary-grid"></section>
+      <section id="results" class="results"></section>
+
+      <section class="signal-guide panel" aria-labelledby="signal-guide-title">
+        <h2 id="signal-guide-title">Signal guide</h2>
+        <p>
+          Green signals are most favorable for a potential short squeeze; red signals are
+          least favorable. Scores are recalculated every time from raw market data.
+        </p>
+        <div id="signal-guide-chart"></div>
+      </section>
+
+      <p class="disclaimer">
+        This scanner is informational only and is not financial advice. Verify data and
+        risk before trading.
+      </p>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

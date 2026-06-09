@@ -8,7 +8,7 @@ flowchart LR
     subgraph WebApp["SqueezeScanner application"]
         UI["HTML/CSS/JS<br/>src/squeeze_scanner/templates<br/>src/squeeze_scanner/static"]
         API["FastAPI routes<br/>/api/model<br/>/api/scan<br/>/api/scan/most-shorted<br/>/api/scans/recent<br/>DELETE /api/scans/{symbol}<br/>/api/health"]
-        Scanner["ScannerService<br/>score recomputation"]
+        Scanner["ScannerService<br/>four-model score recomputation"]
         CacheProvider["CachedMarketDataProvider<br/>1 hour TTL"]
         YahooProvider["YahooFinanceProvider<br/>yfinance adapter"]
     end
@@ -50,7 +50,7 @@ sequenceDiagram
         Cache->>Cache: Store raw TickerSnapshot only
         Cache-->>Scanner: Fresh TickerSnapshot
     end
-    Scanner->>Scanner: Recompute squeeze-v2 score
+    Scanner->>Scanner: Recompute four independent squeeze model scores
     Scanner-->>API: Ranked scan results
     API-->>Browser: Append/update screened cards
 
@@ -74,7 +74,7 @@ sequenceDiagram
 - Source code, templates, and static assets live under `src/squeeze_scanner`; legacy `app.*` modules are compatibility shims.
 - Uvicorn auto-reload can watch `src/squeeze_scanner` during development.
 - Browser, static, and API responses use `Cache-Control: no-store` to prevent stale UI assets.
-- The frontend gets signal labels, weights, descriptions, calculations, tooltips, and legend data from the Python scoring model via `/api/model` and each response `model` block.
+- The frontend gets model definitions, signal labels, weights, descriptions, calculations, tooltips, and legend data from the Python scoring model via `/api/model` and each response `model` block.
 - SQLite stores raw financial-service snapshots plus `fetched_at` and `scanned_at` timestamps. Scores, risk labels, components, rationale, and rendered UI state are never cached.
 - `/api/scans/recent` returns all tickers screened within the current TTL and recomputes their scores with the current model.
 - `DELETE /api/scans/{symbol}` removes one ticker from the SQLite cache; the frontend also removes it from the visible screened list.

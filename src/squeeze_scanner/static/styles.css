@@ -190,7 +190,8 @@ button:disabled {
 }
 
 .summary-card span,
-.component-grid span {
+.component-grid span,
+.model-score-tile span {
   color: var(--muted);
   font-size: 0.82rem;
 }
@@ -317,14 +318,24 @@ tr:last-child td {
   color: var(--muted);
 }
 
+.model-score-grid,
 .component-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
+}
+
+.model-score-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   margin: 18px 0;
 }
 
-.component-grid div {
+.component-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin: 18px 0;
+}
+
+.component-grid div,
+.model-score-tile {
   padding: 12px;
   border: 1px solid var(--border);
   border-radius: 14px;
@@ -360,6 +371,7 @@ tr:last-child td {
 }
 
 .signal-tile,
+.model-score-tile,
 .rationale li,
 .legend-item {
   border-color: var(--signal-border);
@@ -368,12 +380,14 @@ tr:last-child td {
 }
 
 .signal-tile strong,
+.model-score-tile strong,
 .rationale li strong,
 .legend-item strong {
   color: var(--signal-color);
 }
 
-.signal-tile small {
+.signal-tile small,
+.model-score-tile small {
   display: block;
   margin-top: 4px;
   color: var(--muted);
@@ -433,9 +447,46 @@ tr:last-child td {
   transform: translateX(-50%) translateY(0);
 }
 
-.component-grid strong {
+.component-grid strong,
+.model-score-tile strong {
   display: block;
   margin-top: 6px;
+}
+
+.model-breakdowns {
+  display: grid;
+  gap: 10px;
+}
+
+.model-breakdown {
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: rgba(11, 20, 36, 0.7);
+}
+
+.model-breakdown summary {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px 14px;
+  cursor: pointer;
+  font-weight: 800;
+}
+
+.model-breakdown summary strong {
+  color: var(--accent);
+}
+
+.model-breakdown p {
+  margin: 0;
+  padding: 0 14px;
+  line-height: 1.5;
+}
+
+.model-breakdown .component-grid,
+.model-breakdown .rationale {
+  margin-right: 14px;
+  margin-left: 14px;
 }
 
 .scan-age {
@@ -486,6 +537,20 @@ tr:last-child td {
   margin-bottom: 16px;
 }
 
+.model-guide-grid {
+  display: grid;
+  gap: 16px;
+  margin-top: 16px;
+}
+
+.model-guide-card {
+  overflow: hidden;
+}
+
+.model-guide-card h3 {
+  margin: 0 0 8px;
+}
+
 .legend-item {
   display: grid;
   grid-template-columns: auto 1fr;
@@ -530,6 +595,10 @@ tr:last-child td {
   }
 
   .component-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .model-score-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 

@@ -20,8 +20,8 @@ const currencyFormatter = new Intl.NumberFormat("en-US", {
   maximumFractionDigits: 2,
 });
 let modelMetadata = null;
-let signalDefinitions = {};
-let signalOrder = [];
+let modelDefinitions = {};
+let modelOrder = [];
 
 document.addEventListener("DOMContentLoaded", async () => {
   await loadModelMetadata();
@@ -154,25 +154,31 @@ async function loadModelMetadata() {
 }
 
 function applyModelMetadata(model) {
-  if (!model || !Array.isArray(model.signals)) {
+  if (!model || !Array.isArray(model.models)) {
     return;
   }
 
   modelMetadata = model;
-  signalDefinitions = Object.fromEntries(
-    model.signals.map((signal) => [
-      signal.key,
+  modelDefinitions = Object.fromEntries(
+    model.models.map((scoringModel) => [
+      scoringModel.key,
       {
-        key: signal.key,
-        label: signal.label,
-        max: signal.weight,
-        means: signal.means,
-        calculation: signal.calculation,
-        favorable: signal.favorable,
+        key: scoringModel.key,
+        category: scoringModel.category,
+        label: scoringModel.label,
+        definition: scoringModel.definition,
+        signals: scoringModel.signals.map((signal) => ({
+          key: signal.key,
+          label: signal.label,
+          max: signal.weight,
+          means: signal.means,
+          calculation: signal.calculation,
+          favorable: signal.favorable,
+        })),
       },
     ]),
   );
-  signalOrder = model.signals.map((signal) => signal.key);
+  modelOrder = model.models.map((scoringModel) => scoringModel.key);
 }
 
 async function fetchJson(url, options = {}) {
@@ -269,13 +275,12 @@ function renderResults(results) {
         <thead>
           <tr>
             <th>Symbol</th>
-            <th>Score</th>
+            <th>Top score</th>
             <th>Setup</th>
+            ${activeModelKeys(results[0]).map((key) => `<th>${escapeHtml(modelShortLabel(modelDefinition(key)))}</th>`).join("")}
             <th>Price</th>
             <th>Short % Float</th>
-            <th>Days Cover</th>
             <th>Rel Vol</th>
-            <th>5D</th>
             <th>Float</th>
             <th>Scanned</th>
             <th></th>
@@ -294,19 +299,22 @@ function renderResults(results) {
 
 function renderResultRow(result) {
   const metrics = result.metrics;
+  const primaryModel = modelDefinition(result.primary_model);
   return `
     <tr>
       <td>
         <strong>${escapeHtml(result.symbol)}</strong>
         <span>${escapeHtml(result.company_name || "")}</span>
       </td>
-      <td><strong>${formatNumber(result.score)}</strong></td>
+      <td>
+        <strong>${formatNumber(result.score)}</strong>
+        <span>${escapeHtml(primaryModel.label)}</span>
+      </td>
       <td><span class="badge ${badgeClass(result.risk_level)}">${escapeHtml(result.risk_level)}</span></td>
+      ${activeModelKeys(result).map((key) => `<td>${formatNumber(modelScore(result, key))}</td>`).join("")}
       <td>${formatCurrency(metrics.price)}</td>
       <td>${formatPercent(metrics.short_percent_float)}</td>
-      <td>${formatNumber(metrics.short_ratio)}</td>
       <td>${formatMultiple(metrics.relative_volume)}</td>
-      <td class="${trendClass(metrics.change_5d_pct)}">${formatSignedPercent(metrics.change_5d_pct)}</td>
       <td>${formatCompact(metrics.float_shares)}</td>
       <td>${formatScanAge(result.minutes_since_scan)}</td>
       <td>${deleteButton(result.symbol)}</td>
@@ -330,20 +338,20 @@ function renderResultCard(result) {
         <div class="card-actions">
           <div
             class="score has-tooltip"
-            data-tooltip="${escapeHtml(totalScoreTooltip())}"
-            title="${escapeHtml(totalScoreTooltip())}"
+            data-tooltip="${escapeHtml(totalScoreTooltip(result))}"
+            title="${escapeHtml(totalScoreTooltip(result))}"
             tabindex="0"
           >
             <span>${formatNumber(result.score)}</span>
-            <small>${escapeHtml(result.risk_level)}</small>
+            <small>${escapeHtml(modelDefinition(result.primary_model).label)}</small>
           </div>
           ${deleteButton(result.symbol)}
         </div>
       </div>
-      <div class="component-grid">
-        ${signalOrder.map((key) => component(result.components[key], key)).join("")}
+      <div class="model-score-grid">
+        ${activeModelKeys(result).map((key) => modelScoreTile(result, key)).join("")}
       </div>
-      ${renderSignalRationale(result)}
+      ${renderModelBreakdowns(result)}
       ${warnings}
     </article>
   `;
@@ -383,8 +391,51 @@ async function deleteScreenedSymbol(symbol) {
   }
 }
 
-function component(value, key) {
-  const definition = signalDefinition(key);
+function modelScoreTile(result, modelKey) {
+  const definition = modelDefinition(modelKey);
+  const value = modelScore(result, modelKey);
+  const tooltip = modelTooltip(definition);
+  return `
+    <div
+      class="model-score-tile ${signalClass(value, scoreMax())} has-tooltip"
+      data-tooltip="${escapeHtml(tooltip)}"
+      title="${escapeHtml(tooltip)}"
+      tabindex="0"
+    >
+      <span>${escapeHtml(definition.category)}</span>
+      <strong>${formatNumber(value)}</strong>
+      <small>${escapeHtml(definition.label)}</small>
+    </div>
+  `;
+}
+
+function renderModelBreakdowns(result) {
+  return `
+    <div class="model-breakdowns">
+      ${activeModelKeys(result).map((key) => renderModelBreakdown(result, key)).join("")}
+    </div>
+  `;
+}
+
+function renderModelBreakdown(result, modelKey) {
+  const definition = modelDefinition(modelKey);
+  const isPrimary = result.primary_model === modelKey ? " open" : "";
+  return `
+    <details class="model-breakdown"${isPrimary}>
+      <summary>
+        <span>${escapeHtml(definition.category)}: ${escapeHtml(definition.label)}</span>
+        <strong>${formatNumber(modelScore(result, modelKey))}</strong>
+      </summary>
+      <p>${escapeHtml(definition.definition)}</p>
+      <div class="component-grid">
+        ${definition.signals.map((signal) => component(componentScore(result, modelKey, signal.key), signal)).join("")}
+      </div>
+      ${renderSignalRationale(result, modelKey)}
+    </details>
+  `;
+}
+
+function component(value, definition) {
   const tooltip = signalTooltip(definition);
   return `
     <div
@@ -400,16 +451,16 @@ function component(value, key) {
   `;
 }
 
-function renderSignalRationale(result) {
+function renderSignalRationale(result, modelKey) {
   return `
     <ul class="rationale">
-      ${signalRationaleItems(result).map(renderSignalRationaleItem).join("")}
+      ${signalRationaleItems(result, modelKey).map(renderSignalRationaleItem).join("")}
     </ul>
   `;
 }
 
 function renderSignalRationaleItem(item) {
-  const definition = signalDefinition(item.key);
+  const definition = item.definition;
   const value = item.score;
   const tooltip = signalTooltip(definition);
   return `
@@ -424,64 +475,14 @@ function renderSignalRationaleItem(item) {
   `;
 }
 
-function signalRationaleItems(result) {
-  const metrics = result.metrics;
-  return [
-    {
-      key: "short_interest",
-      score: result.components.short_interest,
-      text: metrics.short_percent_float === null || metrics.short_percent_float === undefined
-        ? "short interest unavailable"
-        : `${formatPercent(metrics.short_percent_float)} of float sold short`,
-    },
-    {
-      key: "days_to_cover",
-      score: result.components.days_to_cover,
-      text: metrics.short_ratio === null || metrics.short_ratio === undefined
-        ? "days to cover unavailable"
-        : `${formatNumber(metrics.short_ratio)} days to cover`,
-    },
-    {
-      key: "relative_volume",
-      score: result.components.relative_volume,
-      text: metrics.relative_volume === null || metrics.relative_volume === undefined
-        ? "relative volume unavailable"
-        : `${formatMultiple(metrics.relative_volume)} relative volume`,
-    },
-    {
-      key: "momentum",
-      score: result.components.momentum,
-      text: `1D ${formatSignedPercent(metrics.change_1d_pct)}, 5D ${formatSignedPercent(metrics.change_5d_pct)}, 20D ${formatSignedPercent(metrics.change_20d_pct)}`,
-    },
-    {
-      key: "float_pressure",
-      score: result.components.float_pressure,
-      text: floatPressureText(metrics),
-    },
-    {
-      key: "short_interest_trend",
-      score: result.components.short_interest_trend,
-      text: shortTrendText(metrics.short_interest_change_pct),
-    },
-  ];
-}
-
-function floatPressureText(metrics) {
-  if (metrics.float_shares !== null && metrics.float_shares !== undefined) {
-    return `${formatCompact(metrics.float_shares)} float shares`;
-  }
-  if (metrics.market_cap !== null && metrics.market_cap !== undefined) {
-    return `${formatCompact(metrics.market_cap)} market cap fallback`;
-  }
-  return "float shares and market cap unavailable";
-}
-
-function shortTrendText(change) {
-  if (change === null || change === undefined) {
-    return "short-interest trend unavailable";
-  }
-  const direction = change >= 0 ? "increased" : "decreased";
-  return `short interest ${direction} ${formatPercent(Math.abs(change))} vs prior month`;
+function signalRationaleItems(result, modelKey) {
+  const definition = modelDefinition(modelKey);
+  const rationales = result.model_rationales?.[modelKey] || [];
+  return definition.signals.map((signal, index) => ({
+    definition: signal,
+    score: componentScore(result, modelKey, signal.key),
+    text: rationales[index] || "No rationale returned.",
+  }));
 }
 
 function signalClass(value, maxValue) {
@@ -506,41 +507,36 @@ function signalTooltip(definition) {
   return `${definition.means} Calculation: ${definition.calculation} Favorability: ${definition.favorable}`;
 }
 
-function totalScoreTooltip() {
-  const totalWeight = modelMetadata?.total_weight ?? 100;
-  const signalNames = signalOrder.map((key) => signalDefinition(key).label.toLowerCase()).join(", ");
-  return `Total squeeze setup score from 0 to ${formatNumber(totalWeight)}. It is recomputed from raw market data using ${signalNames}.`;
+function modelTooltip(definition) {
+  const signalNames = definition.signals.map((signal) => signal.label.toLowerCase()).join(", ");
+  return `${definition.category}: ${definition.definition} Signals: ${signalNames}.`;
+}
+
+function totalScoreTooltip(result) {
+  const primaryModel = modelDefinition(result.primary_model);
+  return `Top category score from 0 to ${formatNumber(scoreMax())}. The highest current model is ${primaryModel.label}.`;
 }
 
 function renderSignalGuide() {
   const chart = document.querySelector("#signal-guide-chart");
+  const legend = document.querySelector("#signal-guide-legend");
   if (!chart) return;
   if (!modelMetadata) {
+    if (legend) {
+      legend.innerHTML = "";
+    }
     chart.innerHTML = `<p class="status error">Scoring model metadata is unavailable.</p>`;
     return;
   }
 
-  chart.innerHTML = `
+  if (legend) {
+    legend.innerHTML = `
     <div class="signal-legend" aria-label="Signal favorability color legend">
       ${favorabilityScale().map(legendItem).join("")}
     </div>
-    <div class="table-wrap signal-guide-table">
-      <table>
-        <thead>
-          <tr>
-            <th>Signal</th>
-            <th>Weight</th>
-            <th>What it means</th>
-            <th>How it is calculated</th>
-            <th>Favorable direction</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${signalOrder.map((key) => renderSignalGuideRow(signalDefinition(key))).join("")}
-        </tbody>
-      </table>
-    </div>
   `;
+  }
+  chart.innerHTML = modelOrder.map((key) => renderModelGuideCard(modelDefinition(key))).join("");
 }
 
 function favorabilityScale() {
@@ -564,6 +560,31 @@ function legendItem(item) {
   `;
 }
 
+function renderModelGuideCard(definition) {
+  return `
+    <article class="model-guide-card panel">
+      <h3>${escapeHtml(definition.category)}: ${escapeHtml(definition.label)}</h3>
+      <p>${escapeHtml(definition.definition)}</p>
+      <div class="table-wrap signal-guide-table">
+        <table>
+          <thead>
+            <tr>
+              <th>Signal</th>
+              <th>Weight</th>
+              <th>What it means</th>
+              <th>How it is calculated</th>
+              <th>Favorable direction</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${definition.signals.map(renderSignalGuideRow).join("")}
+          </tbody>
+        </table>
+      </div>
+    </article>
+  `;
+}
+
 function renderSignalGuideRow(definition) {
   return `
     <tr>
@@ -576,15 +597,40 @@ function renderSignalGuideRow(definition) {
   `;
 }
 
-function signalDefinition(key) {
-  return signalDefinitions[key] || {
+function activeModelKeys(result) {
+  if (modelOrder.length) {
+    return modelOrder;
+  }
+  return result?.model_scores ? Object.keys(result.model_scores) : [];
+}
+
+function modelDefinition(key) {
+  return modelDefinitions[key] || {
     key,
-    label: key.replace(/_/g, " "),
-    max: 1,
-    means: "Scoring metadata is unavailable for this signal.",
-    calculation: "Unavailable.",
-    favorable: "Unavailable.",
+    category: "Model",
+    label: String(key || "unknown").replace(/_/g, " "),
+    definition: "Scoring metadata is unavailable for this model.",
+    signals: [],
   };
+}
+
+function modelScore(result, modelKey) {
+  return result.model_scores?.[modelKey] ?? (result.primary_model === modelKey ? result.score : null);
+}
+
+function componentScore(result, modelKey, signalKey) {
+  return result.model_components?.[modelKey]?.[signalKey] ?? null;
+}
+
+function modelShortLabel(definition) {
+  return definition.label
+    .replace("Classical Short Squeeze", "Classical")
+    .replace("Float Compression", "Float")
+    .replace("Gamma Candidate", "Gamma");
+}
+
+function scoreMax() {
+  return modelMetadata?.score_range?.maximum ?? modelMetadata?.total_weight ?? 100;
 }
 
 function renderErrors(errors) {
@@ -614,14 +660,6 @@ function formatPercent(value) {
   return value === null || value === undefined ? "N/A" : `${numberFormatter.format(value)}%`;
 }
 
-function formatSignedPercent(value) {
-  if (value === null || value === undefined) {
-    return "N/A";
-  }
-  const sign = value > 0 ? "+" : "";
-  return `${sign}${numberFormatter.format(value)}%`;
-}
-
 function formatMultiple(value) {
   return value === null || value === undefined ? "N/A" : `${numberFormatter.format(value)}x`;
 }
@@ -634,12 +672,6 @@ function formatScanAge(minutes) {
     return "just now";
   }
   return `${numberFormatter.format(minutes)} min ago`;
-}
-
-function trendClass(value) {
-  if (value > 0) return "positive";
-  if (value < 0) return "negative";
-  return "";
 }
 
 function badgeClass(label) {

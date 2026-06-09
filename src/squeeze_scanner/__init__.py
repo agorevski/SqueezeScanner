@@ -1,2 +1,1 @@
-"""Short squeeze scanner application package."""
-
+"""Squeeze scanner application package."""

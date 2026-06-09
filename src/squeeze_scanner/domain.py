@@ -40,6 +40,15 @@ class TickerSnapshot:
     shares_short_prior_month: float | None = None
     float_shares: float | None = None
     market_cap: float | None = None
+    borrow_fee_pct: float | None = None
+    recent_reverse_split: bool | None = None
+    days_since_reverse_split: float | None = None
+    reverse_split_ratio: float | None = None
+    call_volume: float | None = None
+    put_volume: float | None = None
+    call_open_interest: float | None = None
+    put_open_interest: float | None = None
+    dealer_gamma_exposure_proxy: float | None = None
     change_1d_pct: float | None = None
     change_5d_pct: float | None = None
     change_20d_pct: float | None = None
@@ -54,7 +63,11 @@ class ScanResult:
     score: float
     risk_level: str
     data_quality: float
-    metrics: dict[str, float | None]
+    primary_model: str
+    model_scores: dict[str, float]
+    model_components: dict[str, dict[str, float]]
+    model_rationales: dict[str, list[str]]
+    metrics: dict[str, float | bool | None]
     components: dict[str, float]
     rationale: list[str]
     warnings: list[str]

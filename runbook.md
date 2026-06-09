@@ -1,4 +1,4 @@
-# Short Squeeze Scanner Runbook
+# Squeeze Scanner Runbook
 
 ## Configuration
 
@@ -65,7 +65,7 @@ Expected response:
 Check the homepage:
 
 ```bash
-curl -fsS "${BASE_URL}/" | grep 'Short Squeeze Scanner'
+curl -fsS "${BASE_URL}/" | grep 'Squeeze Scanner'
 ```
 
 ## Stop or restart the service

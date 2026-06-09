@@ -3,17 +3,17 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Short Squeeze Scanner</title>
+    <title>Squeeze Scanner</title>
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
     <main class="shell">
       <section class="hero">
         <p class="eyebrow">Market scanner</p>
-        <h1>Short Squeeze Scanner</h1>
+        <h1>Squeeze Scanner</h1>
         <p class="hero-copy">
-          Rank tickers by short interest, days to cover, relative volume, momentum,
-          float pressure, and short-interest trend.
+          Rank tickers across four independent setup models: classical short squeezes,
+          float compression, gamma candidates, and rare hybrid names.
         </p>
       </section>
 
@@ -46,13 +46,17 @@
       <section id="summary" class="summary-grid"></section>
       <section id="results" class="results"></section>
 
-      <section class="signal-guide panel" aria-labelledby="signal-guide-title">
-        <h2 id="signal-guide-title">Signal guide</h2>
-        <p>
-          Green signals are most favorable for a potential short squeeze; red signals are
-          least favorable. Scores are recalculated every time from raw market data.
-        </p>
-        <div id="signal-guide-chart"></div>
+      <section class="signal-guide" aria-labelledby="signal-guide-title">
+        <div class="model-guide-intro panel">
+          <h2 id="signal-guide-title">Model guide</h2>
+          <p>
+            Each category gets its own 0-100 score. Green signals are most favorable for
+            that model; red signals are least favorable. Scores are recalculated every time
+            from raw market data.
+          </p>
+          <div id="signal-guide-legend"></div>
+        </div>
+        <div id="signal-guide-chart" class="model-guide-grid"></div>
       </section>
 
       <p class="disclaimer">

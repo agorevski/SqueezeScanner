@@ -1,7 +1,7 @@
 [project]
 name = "squeeze-scanner"
 version = "0.1.0"
-description = "A FastAPI short squeeze scanner with a browser front-end."
+description = "A FastAPI squeeze scanner with a browser front-end."
 readme = "readme.md"
 requires-python = ">=3.11"
 dependencies = [

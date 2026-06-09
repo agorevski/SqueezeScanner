@@ -31,8 +31,8 @@ def create_app() -> FastAPI:
     yahoo_screener = YahooFinanceScreener()
 
     app = FastAPI(
-        title="Short Squeeze Scanner",
-        description="Ranks equities by short squeeze setup indicators using public market data.",
+        title="Squeeze Scanner",
+        description="Ranks equities across independent squeeze setup models using public market data.",
         version="0.1.0",
     )
     app.mount("/static", StaticFiles(directory=PACKAGE_ROOT / "static"), name="static")

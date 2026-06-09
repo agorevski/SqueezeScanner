@@ -1,2 +1,1 @@
-"""Short squeeze scanner web application."""
-
+"""Squeeze scanner web application."""

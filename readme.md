@@ -1,6 +1,6 @@
-# Short Squeeze Scanner
+# Squeeze Scanner
 
-A Python/FastAPI website for screening potential short squeeze setups using live Yahoo Finance data through `yfinance`.
+A Python/FastAPI website for screening potential squeeze setups using live Yahoo Finance data through `yfinance`.
 
 This is informational only and is not financial advice.
 
@@ -13,8 +13,9 @@ This is informational only and is not financial advice.
 - Search results append to the screened-stock list instead of replacing it.
 - Trash-can controls remove a screened ticker from both the page and the local SQLite cache.
 - Signal tiles and rationale bullets are color-coded by squeeze favorability: red, orange, yellow, green.
-- Model cards include hover/tap tooltips plus a bottom-of-page signal guide explaining each calculation.
+- Model cards include hover/tap tooltips plus a bottom-of-page model guide explaining each category and calculation.
 - Signal labels, weights, descriptions, calculations, and the color legend come from the Python scoring model API, not hard-coded HTML/JS.
+- Each ticker receives four independent 0-100 scores: Classical Short Squeeze, Float Compression, Gamma Candidate, and Hybrid.
 - Raw market data is cached in SQLite for 1 hour; model scores are always recomputed.
 - `Cache-Control: no-store` is sent for the page, static files, and API responses to avoid stale browser assets.
 - Development server can run with Uvicorn auto-reload for `src/squeeze_scanner`.
@@ -86,7 +87,7 @@ src/squeeze_scanner/
   config.py             .env loading and runtime settings
   domain.py             shared dataclasses, protocols, and errors
   providers/yahoo.py    yfinance/Yahoo Finance adapter
-  scoring.py            squeeze-v2 model metadata and scoring logic
+  scoring.py            four-model metadata and scoring logic
   service.py            ticker normalization, scanning, and response shaping
   web.py                FastAPI app, routes, static assets, and templates
   server.py             console-script entrypoint
@@ -96,7 +97,7 @@ The top-level `app/` package is retained only as a thin compatibility shim for o
 
 ## Market data cache
 
-The cache stores only raw financial-service data from `TickerSnapshot` records, such as price, volume, short interest, days to cover, float shares, and market cap.
+The cache stores only raw financial-service data from `TickerSnapshot` records, such as price, volume, short interest, days to cover, float shares, market cap, split history signals, and option-chain aggregates.
 
 Each row also stores timestamps:
 
@@ -117,22 +118,20 @@ Defaults are configured in `.env.example`:
 - table: `market_data_cache`
 - refresh interval: `3600` seconds
 
-## Scoring model
+## Scoring models
 
-The scanner uses `squeeze-v2`, a 100-point model weighted toward the characteristics that create squeeze pressure:
+The scanner uses `squeeze-v3`, which returns four independent 0-100 model scores per ticker. The top score is used only for sorting and the setup badge; the four category scores remain separate in the API and website.
 
-| Characteristic | Weight | Why it matters |
-| --- | ---: | --- |
-| Short interest % of float | 35 | Core squeeze fuel; the model gives no points below 10%, ramps materially above 20%, and treats 40%+ as extreme. |
-| Days to cover | 20 | Estimates how hard it may be for shorts to exit based on average trading volume; starts contributing above 2 days. |
-| Float pressure | 15 | Smaller tradable floats can move faster when demand spikes; market cap is used only as a weaker fallback. |
-| Momentum | 15 | Positive 1-day, 5-day, and 20-day price action can indicate that covering pressure is starting. |
-| Relative volume | 10 | Elevated volume confirms active demand/liquidity and helps distinguish dormant setups from active squeezes. |
-| Short-interest trend | 5 | Rising short interest adds pressure, but it is weighted lightly because reported short data is delayed. |
+| Model | Signals | Definition |
+| --- | --- | --- |
+| Classical Short Squeeze | Short interest, borrow fee, days to cover | Names with a large short base, expensive borrow when a borrow-fee feed is available, and crowded short exits. |
+| Float Compression | Tiny float, recent reverse split, rapid volume increase | Tiny-float names where recent share-count compression can combine with rising demand. |
+| Gamma Candidate | Heavy call buying, dealer gamma exposure | Options-driven names where call activity and public-options exposure may force dealer hedging flows. |
+| Hybrid | Tiny float, short interest, borrow fee, options activity | Rare names combining compressed supply, high short pressure, costly borrow, and elevated options activity. |
 
-The model does not currently include borrow fees, utilization, fails-to-deliver, options gamma, or news catalysts because those are not reliably available from the current Yahoo Finance data source.
+Yahoo Finance does not provide borrow fees or true dealer positioning. Borrow-fee fields score zero until an external securities-lending feed populates `borrow_fee_pct`; dealer gamma uses a public option-chain exposure proxy when options data is available.
 
-The frontend reads this metadata from `GET /api/model` and from the `model` block included in scan responses. To change the UX legend/tooltips, update `SCORING_SIGNALS` in `src/squeeze_scanner/scoring.py`.
+The frontend reads this metadata from `GET /api/model` and from the `model` block included in scan responses. To change the UX legend/tooltips, update `SCORING_MODELS` in `src/squeeze_scanner/scoring.py`.
 
 ## API
 

@@ -9,8 +9,9 @@ from squeeze_scanner.domain import DataProviderError, InvalidSymbolError, Screen
 from squeeze_scanner.providers.yahoo import YahooFinanceScreener
 from squeeze_scanner.scoring import (
     SCORING_MODEL_VERSION,
+    SCORING_MODEL_WEIGHTS,
+    SCORING_MODELS,
     SCORING_SIGNALS,
-    SCORING_WEIGHTS,
     score_snapshot,
     scoring_model_metadata,
 )
@@ -26,19 +27,29 @@ def test_normalize_symbols_rejects_invalid_symbols():
         normalize_symbols("GME, BAD/SYMBOL")
 
 
-def test_scoring_weights_sum_to_100():
-    assert SCORING_MODEL_VERSION == "squeeze-v2"
-    assert sum(SCORING_WEIGHTS.values()) == 100
-    assert SCORING_WEIGHTS == {signal["key"]: signal["weight"] for signal in SCORING_SIGNALS}
+def test_scoring_models_have_independent_100_point_weights():
+    assert SCORING_MODEL_VERSION == "squeeze-v3"
+    assert {model["key"] for model in SCORING_MODELS} == {
+        "classical_short_squeeze",
+        "float_compression",
+        "gamma_candidate",
+        "hybrid",
+    }
+    for model in SCORING_MODELS:
+        weights = SCORING_MODEL_WEIGHTS[model["key"]]
+        assert sum(weights.values()) == 100
+        assert weights == {signal["key"]: signal["weight"] for signal in model["signals"]}
 
 
-def test_scoring_model_metadata_exposes_signal_legend_from_python_model():
+def test_scoring_model_metadata_exposes_model_definitions_from_python_model():
     metadata = scoring_model_metadata()
 
     assert metadata["version"] == SCORING_MODEL_VERSION
+    assert metadata["models"] == SCORING_MODELS
     assert metadata["signals"] == SCORING_SIGNALS
-    assert metadata["weights"] == SCORING_WEIGHTS
-    assert {signal["key"] for signal in metadata["signals"]} == set(SCORING_WEIGHTS)
+    assert metadata["model_weights"] == SCORING_MODEL_WEIGHTS
+    assert len(metadata["models"]) == 4
+    assert all(model["definition"] and model["signals"] for model in metadata["models"])
     assert all(signal["label"] and signal["calculation"] and signal["favorable"] for signal in metadata["signals"])
 
 
@@ -80,6 +91,15 @@ def test_score_snapshot_identifies_high_quality_squeeze_setup():
             shares_short_prior_month=10_000_000,
             float_shares=8_000_000,
             market_cap=200_000_000,
+            borrow_fee_pct=120.0,
+            recent_reverse_split=True,
+            days_since_reverse_split=12,
+            reverse_split_ratio=0.1,
+            call_volume=30_000,
+            put_volume=2_000,
+            call_open_interest=150_000,
+            put_open_interest=25_000,
+            dealer_gamma_exposure_proxy=30_000_000,
             change_1d_pct=12.36,
             change_5d_pct=35.0,
             change_20d_pct=70.0,
@@ -87,13 +107,18 @@ def test_score_snapshot_identifies_high_quality_squeeze_setup():
         )
     )
 
-    assert result.score >= 95
-    assert result.risk_level == "High squeeze setup"
+    assert result.score == 100
+    assert result.risk_level == "High setup"
     assert result.data_quality == 100
     assert result.metrics["relative_volume"] == 5.0
+    assert set(result.model_scores) == {model["key"] for model in SCORING_MODELS}
+    assert result.model_scores["classical_short_squeeze"] == 100
+    assert result.model_scores["float_compression"] >= 80
+    assert result.model_scores["gamma_candidate"] >= 80
+    assert result.model_scores["hybrid"] >= 90
 
 
-def test_score_snapshot_does_not_flag_low_short_interest_as_high_setup():
+def test_score_snapshot_keeps_independent_models_separate_for_low_short_interest():
     result = score_snapshot(
         TickerSnapshot(
             symbol="MOMO",
@@ -104,6 +129,10 @@ def test_score_snapshot_does_not_flag_low_short_interest_as_high_setup():
             avg_volume_20d=2_000_000,
             short_percent_float=5.0,
             short_ratio=1.0,
+            borrow_fee_pct=0.0,
+            call_volume=50,
+            put_volume=100,
+            call_open_interest=100,
             shares_short=500_000,
             shares_short_prior_month=450_000,
             float_shares=8_000_000,
@@ -115,9 +144,10 @@ def test_score_snapshot_does_not_flag_low_short_interest_as_high_setup():
         )
     )
 
-    assert result.components["short_interest"] == 0.0
-    assert result.score < 50
-    assert result.risk_level != "High squeeze setup"
+    assert result.model_components["classical_short_squeeze"]["short_interest"] == 0.0
+    assert result.model_components["hybrid"]["short_interest"] == 0.0
+    assert result.model_scores["classical_short_squeeze"] < 10
+    assert result.model_scores["gamma_candidate"] < 10
 
 
 def test_cached_provider_reuses_raw_data_for_one_hour(tmp_path):

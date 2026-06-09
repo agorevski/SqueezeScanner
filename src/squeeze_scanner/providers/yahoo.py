@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
+from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 
 from squeeze_scanner.domain import DataProviderError, ScreenerError, TickerSnapshot
@@ -72,6 +73,11 @@ class YahooFinanceProvider:
         if price is not None and fifty_two_week_high and fifty_two_week_high > 0:
             distance_from_high = ((price / fifty_two_week_high) - 1.0) * 100.0
 
+        reverse_split_metrics, reverse_split_warnings = _reverse_split_metrics(ticker)
+        warnings.extend(reverse_split_warnings)
+        options_metrics, options_warnings = _options_metrics(ticker, price)
+        warnings.extend(options_warnings)
+
         return TickerSnapshot(
             symbol=symbol,
             company_name=_first_text(info, "shortName", "longName", "displayName"),
@@ -86,6 +92,14 @@ class YahooFinanceProvider:
             shares_short_prior_month=_first_number(info, "sharesShortPriorMonth"),
             float_shares=_first_number(info, "floatShares", "sharesFloat"),
             market_cap=_first_number(info, "marketCap"),
+            recent_reverse_split=reverse_split_metrics["recent_reverse_split"],
+            days_since_reverse_split=reverse_split_metrics["days_since_reverse_split"],
+            reverse_split_ratio=reverse_split_metrics["reverse_split_ratio"],
+            call_volume=options_metrics["call_volume"],
+            put_volume=options_metrics["put_volume"],
+            call_open_interest=options_metrics["call_open_interest"],
+            put_open_interest=options_metrics["put_open_interest"],
+            dealer_gamma_exposure_proxy=options_metrics["dealer_gamma_exposure_proxy"],
             change_1d_pct=_pct_change(price, previous_close),
             change_5d_pct=_history_pct_change(close_values, 5),
             change_20d_pct=_history_pct_change(close_values, 20),
@@ -145,6 +159,104 @@ def _symbols_from_quotes(quotes: Sequence[Mapping[str, Any]]) -> list[str]:
     return symbols
 
 
+def _reverse_split_metrics(ticker: Any, lookback_days: int = 180) -> tuple[dict[str, float | bool | None], list[str]]:
+    empty = {
+        "recent_reverse_split": None,
+        "days_since_reverse_split": None,
+        "reverse_split_ratio": None,
+    }
+    try:
+        splits = ticker.splits
+    except Exception as exc:
+        return empty, [f"Split history unavailable: {exc}"]
+
+    if splits is None or getattr(splits, "empty", True):
+        return {**empty, "recent_reverse_split": False}, []
+
+    now = datetime.now(timezone.utc)
+    latest_reverse_split: tuple[float | None, float] | None = None
+    for index, value in splits.items():
+        ratio = _to_float(value)
+        if ratio is None or ratio >= 1.0:
+            continue
+        split_datetime = _to_datetime(index)
+        days_since_split = (now - split_datetime).days if split_datetime is not None else None
+        if latest_reverse_split is None:
+            latest_reverse_split = (days_since_split, ratio)
+            continue
+        current_days = latest_reverse_split[0]
+        if days_since_split is not None and (current_days is None or days_since_split < current_days):
+            latest_reverse_split = (days_since_split, ratio)
+
+    if latest_reverse_split is None:
+        return {**empty, "recent_reverse_split": False}, []
+
+    days_since_split, ratio = latest_reverse_split
+    is_recent = days_since_split is None or days_since_split <= lookback_days
+    return {
+        "recent_reverse_split": is_recent,
+        "days_since_reverse_split": float(days_since_split) if days_since_split is not None else None,
+        "reverse_split_ratio": ratio,
+    }, []
+
+
+def _options_metrics(
+    ticker: Any,
+    price: float | None,
+    max_expirations: int = 2,
+) -> tuple[dict[str, float | None], list[str]]:
+    empty = {
+        "call_volume": None,
+        "put_volume": None,
+        "call_open_interest": None,
+        "put_open_interest": None,
+        "dealer_gamma_exposure_proxy": None,
+    }
+    try:
+        expirations = list(getattr(ticker, "options", ()) or ())
+    except Exception as exc:
+        return empty, [f"Options expirations unavailable: {exc}"]
+
+    if not expirations:
+        return empty, []
+
+    call_volume = 0.0
+    put_volume = 0.0
+    call_open_interest = 0.0
+    put_open_interest = 0.0
+    dealer_gamma_exposure_proxy = 0.0
+    populated = False
+    warnings: list[str] = []
+
+    for expiration in expirations[:max_expirations]:
+        try:
+            chain = ticker.option_chain(expiration)
+        except Exception as exc:
+            warnings.append(f"Options chain unavailable for {expiration}: {exc}")
+            continue
+
+        calls = getattr(chain, "calls", None)
+        puts = getattr(chain, "puts", None)
+        call_volume += _sum_column(calls, "volume")
+        put_volume += _sum_column(puts, "volume")
+        call_open_interest += _sum_column(calls, "openInterest")
+        put_open_interest += _sum_column(puts, "openInterest")
+        dealer_gamma_exposure_proxy += _near_money_exposure_proxy(calls, price)
+        dealer_gamma_exposure_proxy += _near_money_exposure_proxy(puts, price)
+        populated = True
+
+    if not populated:
+        return empty, warnings
+
+    return {
+        "call_volume": call_volume,
+        "put_volume": put_volume,
+        "call_open_interest": call_open_interest,
+        "put_open_interest": put_open_interest,
+        "dealer_gamma_exposure_proxy": dealer_gamma_exposure_proxy if price is not None else None,
+    }, warnings
+
+
 def _pct_change(current: float | None, previous: float | None) -> float | None:
     if current is None or previous is None or previous == 0:
         return None
@@ -166,6 +278,35 @@ def _series_values(history: Any, column: str) -> list[float]:
         if number is not None:
             values.append(number)
     return values
+
+
+def _sum_column(frame: Any, column: str) -> float:
+    if frame is None or getattr(frame, "empty", True) or column not in frame:
+        return 0.0
+    total = 0.0
+    for value in frame[column].dropna().tolist():
+        number = _to_float(value)
+        if number is not None:
+            total += number
+    return total
+
+
+def _near_money_exposure_proxy(frame: Any, price: float | None, strike_window: float = 0.15) -> float:
+    if price is None or price <= 0 or frame is None or getattr(frame, "empty", True):
+        return 0.0
+    if "strike" not in frame or "openInterest" not in frame:
+        return 0.0
+
+    lower_strike = price * (1.0 - strike_window)
+    upper_strike = price * (1.0 + strike_window)
+    exposure = 0.0
+    for row in frame[["strike", "openInterest"]].dropna().to_dict("records"):
+        strike = _to_float(row.get("strike"))
+        open_interest = _to_float(row.get("openInterest"))
+        if strike is None or open_interest is None or not lower_strike <= strike <= upper_strike:
+            continue
+        exposure += open_interest * 100.0 * price
+    return exposure
 
 
 def _mean_tail(values: Sequence[float], count: int) -> float | None:
@@ -197,6 +338,19 @@ def _first_text(data: Mapping[str, Any], *keys: str) -> str | None:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return None
+
+
+def _to_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        datetime_value = value
+    elif hasattr(value, "to_pydatetime"):
+        datetime_value = value.to_pydatetime()
+    else:
+        return None
+
+    if datetime_value.tzinfo is None:
+        return datetime_value.replace(tzinfo=timezone.utc)
+    return datetime_value.astimezone(timezone.utc)
 
 
 def _to_float(value: Any) -> float | None:

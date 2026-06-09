@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.scripts]
-squeeze-scanner = "app.server:main"
+squeeze-scanner = "squeeze_scanner.server:main"
 
 [build-system]
 requires = ["hatchling>=1.25"]
@@ -26,11 +26,12 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["app"]
+packages = ["src/squeeze_scanner", "app"]
 
 [tool.hatch.build.targets.wheel.force-include]
-"static" = "static"
-"templates" = "templates"
+"src/squeeze_scanner/static" = "squeeze_scanner/static"
+"src/squeeze_scanner/templates" = "squeeze_scanner/templates"
 
 [tool.pytest.ini_options]
+pythonpath = ["src"]
 testpaths = ["tests"]

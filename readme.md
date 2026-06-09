@@ -7,15 +7,17 @@ This is informational only and is not financial advice.
 ## Features
 
 - Browser UI for scanning comma-, space-, or semicolon-separated ticker symbols.
+- One-click Yahoo most-shorted loader that screens Yahoo's predefined most-shorted universe.
 - Default prefill list: `INHD, MSFT, ZM, GME, AMC, CVNA, BYND, RILY`.
 - Recent screened stocks load automatically from the local cache when the page opens.
 - Search results append to the screened-stock list instead of replacing it.
+- Trash-can controls remove a screened ticker from both the page and the local SQLite cache.
 - Signal tiles and rationale bullets are color-coded by squeeze favorability: red, orange, yellow, green.
 - Model cards include hover/tap tooltips plus a bottom-of-page signal guide explaining each calculation.
 - Signal labels, weights, descriptions, calculations, and the color legend come from the Python scoring model API, not hard-coded HTML/JS.
 - Raw market data is cached in SQLite for 1 hour; model scores are always recomputed.
 - `Cache-Control: no-store` is sent for the page, static files, and API responses to avoid stale browser assets.
-- Development server can run with Uvicorn auto-reload for `app/`, `templates/`, and `static/`.
+- Development server can run with Uvicorn auto-reload for `src/squeeze_scanner`.
 
 ## Requirements
 
@@ -68,15 +70,29 @@ uv run squeeze-scanner
 If you prefer invoking Uvicorn directly:
 
 ```bash
-uv run uvicorn app.main:app \
-  --app-dir . \
+uv run uvicorn squeeze_scanner.web:app \
+  --app-dir src \
   --host "${SQUEEZE_SCANNER_HOST:-127.0.0.1}" \
   --port "${SQUEEZE_SCANNER_PORT:-7890}" \
   --reload \
-  --reload-dir app \
-  --reload-dir templates \
-  --reload-dir static
+  --reload-dir src/squeeze_scanner
 ```
+
+## Project layout
+
+```text
+src/squeeze_scanner/
+  cache.py              SQLite raw market data cache
+  config.py             .env loading and runtime settings
+  domain.py             shared dataclasses, protocols, and errors
+  providers/yahoo.py    yfinance/Yahoo Finance adapter
+  scoring.py            squeeze-v2 model metadata and scoring logic
+  service.py            ticker normalization, scanning, and response shaping
+  web.py                FastAPI app, routes, static assets, and templates
+  server.py             console-script entrypoint
+```
+
+The top-level `app/` package is retained only as a thin compatibility shim for older `app.main:app` or `app.scanner` imports.
 
 ## Market data cache
 
@@ -116,7 +132,7 @@ The scanner uses `squeeze-v2`, a 100-point model weighted toward the characteris
 
 The model does not currently include borrow fees, utilization, fails-to-deliver, options gamma, or news catalysts because those are not reliably available from the current Yahoo Finance data source.
 
-The frontend reads this metadata from `GET /api/model` and from the `model` block included in scan responses. To change the UX legend/tooltips, update `SCORING_SIGNALS` in `app/scanner.py`.
+The frontend reads this metadata from `GET /api/model` and from the `model` block included in scan responses. To change the UX legend/tooltips, update `SCORING_SIGNALS` in `src/squeeze_scanner/scoring.py`.
 
 ## API
 
@@ -126,7 +142,9 @@ The frontend reads this metadata from `GET /api/model` and from the `model` bloc
 | `GET` | `/api/health` | Health check |
 | `GET` | `/api/model` | Current scoring model metadata used by the UI legend and tooltips |
 | `GET` | `/api/scans/recent` | Scores tickers screened within the last hour from cached raw snapshots |
+| `DELETE` | `/api/scans/{symbol}` | Deletes one ticker from the local cache so it disappears from the current UX |
 | `POST` | `/api/scan` | Scans requested tickers, using cached raw data unless stale |
+| `POST` | `/api/scan/most-shorted?count=100` | Loads Yahoo's predefined most-shorted universe and analyzes those tickers |
 
 Example:
 
@@ -136,6 +154,12 @@ curl -X POST "http://${SQUEEZE_SCANNER_HOST:-127.0.0.1}:${SQUEEZE_SCANNER_PORT:-
   -d '{"symbols":"INHD, BYND"}'
 ```
 
+Yahoo most-shorted example:
+
+```bash
+curl -X POST "http://${SQUEEZE_SCANNER_HOST:-127.0.0.1}:${SQUEEZE_SCANNER_PORT:-7890}/api/scan/most-shorted?count=100"
+```
+
 ## Test
 
 ```bash
@@ -143,4 +167,3 @@ uv run pytest
 ```
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the component diagram and data flow.
-

@@ -6,8 +6,8 @@ flowchart LR
     Network --> Uvicorn["Uvicorn<br/>FastAPI app"]
 
     subgraph WebApp["SqueezeScanner application"]
-        UI["HTML/CSS/JS<br/>templates + static"]
-        API["FastAPI routes<br/>/api/model<br/>/api/scan<br/>/api/scans/recent<br/>/api/health"]
+        UI["HTML/CSS/JS<br/>src/squeeze_scanner/templates<br/>src/squeeze_scanner/static"]
+        API["FastAPI routes<br/>/api/model<br/>/api/scan<br/>/api/scan/most-shorted<br/>/api/scans/recent<br/>DELETE /api/scans/{symbol}<br/>/api/health"]
         Scanner["ScannerService<br/>score recomputation"]
         CacheProvider["CachedMarketDataProvider<br/>1 hour TTL"]
         YahooProvider["YahooFinanceProvider<br/>yfinance adapter"]
@@ -53,15 +53,30 @@ sequenceDiagram
     Scanner->>Scanner: Recompute squeeze-v2 score
     Scanner-->>API: Ranked scan results
     API-->>Browser: Append/update screened cards
+
+    Browser->>API: POST /api/scan/most-shorted
+    API->>Yahoo: Load Yahoo predefined most_shorted_stocks screener
+    Yahoo-->>API: Candidate symbols
+    API->>Scanner: Analyze screener symbols through normal scanner/cache path
+    Scanner-->>API: Ranked scan results
+    API-->>Browser: Merge analyzed universe into screened cards
+
+    Browser->>API: DELETE /api/scans/{symbol}
+    API->>Cache: Delete symbol row
+    Cache-->>API: Deleted flag
+    API-->>Browser: Remove card/row from page
 ```
 
 ## Key design points
 
 - `uv` manages dependencies and the `squeeze-scanner` console script.
 - Network binding, port, reload mode, cache path, and cache TTL are configured through `.env`; `.env.example` documents the supported variables.
-- Uvicorn auto-reload can watch `app/`, `templates/`, and `static/` during development.
+- Source code, templates, and static assets live under `src/squeeze_scanner`; legacy `app.*` modules are compatibility shims.
+- Uvicorn auto-reload can watch `src/squeeze_scanner` during development.
 - Browser, static, and API responses use `Cache-Control: no-store` to prevent stale UI assets.
 - The frontend gets signal labels, weights, descriptions, calculations, tooltips, and legend data from the Python scoring model via `/api/model` and each response `model` block.
 - SQLite stores raw financial-service snapshots plus `fetched_at` and `scanned_at` timestamps. Scores, risk labels, components, rationale, and rendered UI state are never cached.
 - `/api/scans/recent` returns all tickers screened within the current TTL and recomputes their scores with the current model.
+- `DELETE /api/scans/{symbol}` removes one ticker from the SQLite cache; the frontend also removes it from the visible screened list.
 - `/api/scan` uses cached raw data for fresh symbols and fetches Yahoo Finance only for new or stale symbols.
+- `/api/scan/most-shorted` pulls Yahoo's predefined most-shorted screener symbols, then analyzes them through the same scanner/cache path.

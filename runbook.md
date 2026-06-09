@@ -104,6 +104,12 @@ curl -fsS -X POST "${BASE_URL}/api/scan" \
   -d '{"symbols":"BYND"}' | python3 -m json.tool
 ```
 
+Load and analyze Yahoo's most-shorted universe:
+
+```bash
+curl -fsS -X POST "${BASE_URL}/api/scan/most-shorted?count=100" | python3 -m json.tool
+```
+
 Load recent cached scans:
 
 ```bash
@@ -114,6 +120,12 @@ Inspect the scoring model metadata used by the frontend legend and tooltips:
 
 ```bash
 curl -fsS "${BASE_URL}/api/model" | python3 -m json.tool
+```
+
+Delete one ticker from the scanner page and local cache:
+
+```bash
+curl -fsS -X DELETE "${BASE_URL}/api/scans/BYND" | python3 -m json.tool
 ```
 
 ## Cache operations
@@ -140,7 +152,7 @@ Force the next scan to refresh all market data:
 sqlite3 "${SQUEEZE_SCANNER_CACHE_DB:-data/market_data_cache.sqlite3}" "DELETE FROM market_data_cache;"
 ```
 
-Force one ticker to refresh:
+Force one ticker to refresh manually:
 
 ```bash
 sqlite3 "${SQUEEZE_SCANNER_CACHE_DB:-data/market_data_cache.sqlite3}" "DELETE FROM market_data_cache WHERE symbol = 'BYND';"
@@ -165,4 +177,3 @@ for `/`, `/static/*`, and `/api/*`. If a phone still shows stale assets, force-c
 | Scan is slow | New or stale tickers require a Yahoo Finance fetch; cached tickers under 1 hour should return faster. |
 | Market data is missing | Confirm outbound internet access and try a liquid ticker such as `AAPL` or `BYND`. |
 | Cache appears wrong | Delete the ticker row from `market_data_cache`; the next scan will refresh raw data. |
-

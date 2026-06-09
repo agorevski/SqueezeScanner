@@ -4,20 +4,17 @@ from datetime import datetime, timezone
 
 import pytest
 
-from app.cache import CachedMarketDataProvider
-from app.scanner import (
+from squeeze_scanner.cache import CachedMarketDataProvider
+from squeeze_scanner.domain import DataProviderError, InvalidSymbolError, ScreenerError, TickerSnapshot
+from squeeze_scanner.providers.yahoo import YahooFinanceScreener
+from squeeze_scanner.scoring import (
     SCORING_MODEL_VERSION,
     SCORING_SIGNALS,
     SCORING_WEIGHTS,
-    DataProviderError,
-    InvalidSymbolError,
-    ScannerService,
-    TickerSnapshot,
-    build_scan_response,
-    normalize_symbols,
     score_snapshot,
     scoring_model_metadata,
 )
+from squeeze_scanner.service import ScannerService, build_scan_response, normalize_symbols
 
 
 def test_normalize_symbols_splits_dedupes_and_uppercases():
@@ -43,6 +40,29 @@ def test_scoring_model_metadata_exposes_signal_legend_from_python_model():
     assert metadata["weights"] == SCORING_WEIGHTS
     assert {signal["key"] for signal in metadata["signals"]} == set(SCORING_WEIGHTS)
     assert all(signal["label"] and signal["calculation"] and signal["favorable"] for signal in metadata["signals"])
+
+
+def test_yahoo_most_shorted_screener_extracts_unique_symbols():
+    screener = YahooFinanceScreener(
+        screen=lambda query, count: {
+            "quotes": [
+                {"symbol": "hubc"},
+                {"symbol": "HUBC"},
+                {"symbol": " WOLF "},
+                {"symbol": ""},
+                {"not_symbol": "IGNORED"},
+            ]
+        }
+    )
+
+    assert screener.most_shorted_symbols(count=100) == ["HUBC", "WOLF"]
+
+
+def test_yahoo_most_shorted_screener_rejects_empty_results():
+    screener = YahooFinanceScreener(screen=lambda query, count: {"quotes": []})
+
+    with pytest.raises(ScreenerError):
+        screener.most_shorted_symbols(count=100)
 
 
 def test_score_snapshot_identifies_high_quality_squeeze_setup():
@@ -160,6 +180,19 @@ def test_cached_provider_updates_scan_time_without_refreshing_fresh_raw_data(tmp
     assert provider.calls == 1
     assert fetched_at == 1_000.0
     assert scanned_at == 1_120.0
+
+
+def test_cached_provider_deletes_symbol_from_local_cache(tmp_path):
+    class StaticProvider:
+        def fetch(self, symbol):
+            return TickerSnapshot(symbol=symbol, price=10.0)
+
+    cached_provider = CachedMarketDataProvider(StaticProvider(), tmp_path / "market.sqlite3")
+    cached_provider.fetch("BYND")
+
+    assert cached_provider.delete("BYND") is True
+    assert cached_provider.delete("BYND") is False
+    assert cached_provider.recent_snapshots() == []
 
 
 def test_cached_provider_stores_only_raw_market_snapshot_not_scores(tmp_path):

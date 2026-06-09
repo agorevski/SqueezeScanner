@@ -1,5 +1,6 @@
 const form = document.querySelector("#scan-form");
 const button = document.querySelector("#scan-button");
+const mostShortedButton = document.querySelector("#most-shorted-button");
 const statusEl = document.querySelector("#status");
 const resultsEl = document.querySelector("#results");
 const summaryEl = document.querySelector("#summary");
@@ -28,6 +29,12 @@ document.addEventListener("DOMContentLoaded", async () => {
 });
 
 document.addEventListener("click", (event) => {
+  const deleteButton = event.target.closest("[data-delete-symbol]");
+  if (deleteButton) {
+    deleteScreenedSymbol(deleteButton.dataset.deleteSymbol);
+    return;
+  }
+
   const tooltipTarget = event.target.closest(".has-tooltip");
   document
     .querySelectorAll(".has-tooltip.tooltip-open")
@@ -55,7 +62,7 @@ document.addEventListener("keydown", (event) => {
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
-  setLoading(true);
+  setLoading(true, "Scanning...", "Checking cache and refreshing stale market data.");
   clearErrors();
 
   const symbols = new FormData(form).get("symbols");
@@ -79,6 +86,40 @@ form.addEventListener("submit", async (event) => {
     statusEl.className = payload.count ? "status success" : "status error";
   } catch (error) {
     statusEl.textContent = error.message;
+    statusEl.className = "status error";
+  } finally {
+    setLoading(false);
+  }
+});
+
+mostShortedButton.addEventListener("click", async () => {
+  setLoading(
+    true,
+    "Scanning...",
+    "Loading Yahoo's most-shorted universe, then analyzing each ticker.",
+    mostShortedButton,
+    "Loading...",
+  );
+  clearErrors();
+
+  try {
+    const payload = await fetchJson("/api/scan/most-shorted?count=100", {
+      method: "POST",
+    });
+
+    applyModelMetadata(payload.model);
+    renderSignalGuide();
+    mergeResults(payload.results);
+    renderScreenedResults();
+    renderErrors(payload.errors);
+
+    const errorCount = payload.errors?.length || 0;
+    statusEl.textContent = `Loaded Yahoo most-shorted stocks and analyzed ${payload.count} ticker${
+      payload.count === 1 ? "" : "s"
+    }${errorCount ? ` (${errorCount} unavailable)` : ""}.`;
+    statusEl.className = payload.count ? "status success" : "status error";
+  } catch (error) {
+    statusEl.textContent = `Could not load Yahoo most-shorted stocks: ${error.message}`;
     statusEl.className = "status error";
   } finally {
     setLoading(false);
@@ -143,11 +184,22 @@ async function fetchJson(url, options = {}) {
   return payload;
 }
 
-function setLoading(isLoading) {
+function setLoading(
+  isLoading,
+  primaryLoadingText = "Scanning...",
+  message = "Checking cache and refreshing stale market data.",
+  activeButton = button,
+  activeLoadingText = primaryLoadingText,
+) {
   button.disabled = isLoading;
-  button.textContent = isLoading ? "Scanning..." : "Scan";
+  mostShortedButton.disabled = isLoading;
+
+  button.textContent = isLoading && activeButton === button ? primaryLoadingText : "Scan";
+  mostShortedButton.textContent =
+    isLoading && activeButton === mostShortedButton ? activeLoadingText : "Load Yahoo most-shorted";
+
   if (isLoading) {
-    statusEl.textContent = "Checking cache and refreshing stale market data.";
+    statusEl.textContent = message;
     statusEl.className = "status";
   }
 }
@@ -226,6 +278,7 @@ function renderResults(results) {
             <th>5D</th>
             <th>Float</th>
             <th>Scanned</th>
+            <th></th>
           </tr>
         </thead>
         <tbody>
@@ -256,6 +309,7 @@ function renderResultRow(result) {
       <td class="${trendClass(metrics.change_5d_pct)}">${formatSignedPercent(metrics.change_5d_pct)}</td>
       <td>${formatCompact(metrics.float_shares)}</td>
       <td>${formatScanAge(result.minutes_since_scan)}</td>
+      <td>${deleteButton(result.symbol)}</td>
     </tr>
   `;
 }
@@ -273,14 +327,17 @@ function renderResultCard(result) {
           <p>${escapeHtml(result.company_name || "Company name unavailable")}</p>
           <p class="scan-age">Scanned ${formatScanAge(result.minutes_since_scan)}</p>
         </div>
-        <div
-          class="score has-tooltip"
-          data-tooltip="${escapeHtml(totalScoreTooltip())}"
-          title="${escapeHtml(totalScoreTooltip())}"
-          tabindex="0"
-        >
-          <span>${formatNumber(result.score)}</span>
-          <small>${escapeHtml(result.risk_level)}</small>
+        <div class="card-actions">
+          <div
+            class="score has-tooltip"
+            data-tooltip="${escapeHtml(totalScoreTooltip())}"
+            title="${escapeHtml(totalScoreTooltip())}"
+            tabindex="0"
+          >
+            <span>${formatNumber(result.score)}</span>
+            <small>${escapeHtml(result.risk_level)}</small>
+          </div>
+          ${deleteButton(result.symbol)}
         </div>
       </div>
       <div class="component-grid">
@@ -290,6 +347,40 @@ function renderResultCard(result) {
       ${warnings}
     </article>
   `;
+}
+
+function deleteButton(symbol) {
+  return `
+    <button
+      type="button"
+      class="icon-button delete-button"
+      data-delete-symbol="${escapeHtml(symbol)}"
+      aria-label="Delete ${escapeHtml(symbol)} from scanner"
+      title="Delete ${escapeHtml(symbol)} from scanner"
+    >
+      🗑
+    </button>
+  `;
+}
+
+async function deleteScreenedSymbol(symbol) {
+  if (!symbol) return;
+
+  try {
+    const payload = await fetchJson(`/api/scans/${encodeURIComponent(symbol)}`, {
+      method: "DELETE",
+    });
+    screenedResults.delete(payload.symbol);
+    renderScreenedResults();
+    clearErrors();
+    statusEl.textContent = payload.deleted
+      ? `Deleted ${payload.symbol} from the scanner and local cache.`
+      : `${payload.symbol} was not present in the local cache. Removed it from this page.`;
+    statusEl.className = "status success";
+  } catch (error) {
+    statusEl.textContent = `Could not delete ${symbol}: ${error.message}`;
+    statusEl.className = "status error";
+  }
 }
 
 function component(value, key) {

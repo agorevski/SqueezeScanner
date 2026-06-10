@@ -78,32 +78,44 @@ class YahooFinanceProvider:
         options_metrics, options_warnings = _options_metrics(ticker, price)
         warnings.extend(options_warnings)
 
+        data_fields = {
+            "price": price,
+            "previous_close": previous_close,
+            "volume": volume,
+            "avg_volume_20d": avg_volume_20d,
+            "avg_volume_90d": avg_volume_90d,
+            "short_percent_float": _as_percent(_first_number(info, "shortPercentOfFloat")),
+            "short_ratio": _first_number(info, "shortRatio"),
+            "shares_short": _first_number(info, "sharesShort"),
+            "shares_short_prior_month": _first_number(info, "sharesShortPriorMonth"),
+            "float_shares": _first_number(info, "floatShares", "sharesFloat"),
+            "market_cap": _first_number(info, "marketCap"),
+            "borrow_fee_pct": None,
+            "recent_reverse_split": reverse_split_metrics["recent_reverse_split"],
+            "days_since_reverse_split": reverse_split_metrics["days_since_reverse_split"],
+            "reverse_split_ratio": reverse_split_metrics["reverse_split_ratio"],
+            "call_volume": options_metrics["call_volume"],
+            "put_volume": options_metrics["put_volume"],
+            "call_open_interest": options_metrics["call_open_interest"],
+            "put_open_interest": options_metrics["put_open_interest"],
+            "dealer_gamma_exposure_proxy": options_metrics["dealer_gamma_exposure_proxy"],
+            "change_1d_pct": _pct_change(price, previous_close),
+            "change_5d_pct": _history_pct_change(close_values, 5),
+            "change_20d_pct": _history_pct_change(close_values, 20),
+            "distance_from_52_week_high_pct": distance_from_high,
+        }
+
         return TickerSnapshot(
             symbol=symbol,
             company_name=_first_text(info, "shortName", "longName", "displayName"),
-            price=price,
-            previous_close=previous_close,
-            volume=volume,
-            avg_volume_20d=avg_volume_20d,
-            avg_volume_90d=avg_volume_90d,
-            short_percent_float=_as_percent(_first_number(info, "shortPercentOfFloat")),
-            short_ratio=_first_number(info, "shortRatio"),
-            shares_short=_first_number(info, "sharesShort"),
-            shares_short_prior_month=_first_number(info, "sharesShortPriorMonth"),
-            float_shares=_first_number(info, "floatShares", "sharesFloat"),
-            market_cap=_first_number(info, "marketCap"),
-            recent_reverse_split=reverse_split_metrics["recent_reverse_split"],
-            days_since_reverse_split=reverse_split_metrics["days_since_reverse_split"],
-            reverse_split_ratio=reverse_split_metrics["reverse_split_ratio"],
-            call_volume=options_metrics["call_volume"],
-            put_volume=options_metrics["put_volume"],
-            call_open_interest=options_metrics["call_open_interest"],
-            put_open_interest=options_metrics["put_open_interest"],
-            dealer_gamma_exposure_proxy=options_metrics["dealer_gamma_exposure_proxy"],
-            change_1d_pct=_pct_change(price, previous_close),
-            change_5d_pct=_history_pct_change(close_values, 5),
-            change_20d_pct=_history_pct_change(close_values, 20),
-            distance_from_52_week_high_pct=distance_from_high,
+            **data_fields,
+            source_fetched_at=datetime.now(timezone.utc).isoformat(),
+            field_sources=_field_sources(data_fields),
+            field_quality=_field_quality(data_fields),
+            source_quality={
+                "yahoo_finance": 70.0,
+                "yahoo_finance_options_proxy": 55.0,
+            },
             source_warnings=warnings,
         )
 
@@ -157,6 +169,32 @@ def _symbols_from_quotes(quotes: Sequence[Mapping[str, Any]]) -> list[str]:
             symbols.append(normalized)
             seen.add(normalized)
     return symbols
+
+
+def _field_sources(data_fields: Mapping[str, Any]) -> dict[str, str]:
+    sources: dict[str, str] = {}
+    for field_name, value in data_fields.items():
+        if value is None:
+            continue
+        sources[field_name] = (
+            "yahoo_finance_options_proxy"
+            if field_name == "dealer_gamma_exposure_proxy"
+            else "yahoo_finance"
+        )
+    return sources
+
+
+def _field_quality(data_fields: Mapping[str, Any]) -> dict[str, str]:
+    estimated_fields = {"dealer_gamma_exposure_proxy"}
+    quality: dict[str, str] = {}
+    for field_name, value in data_fields.items():
+        if value is None:
+            quality[field_name] = "missing"
+        elif field_name in estimated_fields:
+            quality[field_name] = "estimated"
+        else:
+            quality[field_name] = "present"
+    return quality
 
 
 def _reverse_split_metrics(ticker: Any, lookback_days: int = 180) -> tuple[dict[str, float | bool | None], list[str]]:

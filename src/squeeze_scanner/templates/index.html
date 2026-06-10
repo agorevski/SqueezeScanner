@@ -43,6 +43,82 @@
       </section>
 
       <section id="status" class="status" aria-live="polite"></section>
+
+      <section class="panel roadmap-control-panel" aria-labelledby="roadmap-controls-title">
+        <div class="filter-heading">
+          <div>
+            <h2 id="roadmap-controls-title">Roadmap controls</h2>
+            <p class="hint">
+              Rank, save, and revisit screens or watchlists as backend roadmap APIs become
+              available.
+            </p>
+          </div>
+        </div>
+        <div class="filter-grid roadmap-grid">
+          <label for="ranking-mode">
+            <span>Rank by</span>
+            <select id="ranking-mode">
+              <option value="top_score">Top score</option>
+              <option value="selected_model_score">Selected model score</option>
+              <option value="highest_model_confidence">Highest confidence</option>
+              <option value="score_increase_1h">Biggest 1h score increase</option>
+              <option value="score_increase_24h">Biggest 24h score increase</option>
+              <option value="previous_scan_delta">Previous-scan change</option>
+              <option value="relative_volume">Highest relative volume</option>
+              <option value="short_interest">Highest short % float</option>
+              <option value="smallest_float">Smallest float</option>
+              <option value="hybrid_only">Hybrid score only</option>
+              <option value="gamma_candidate_only">Gamma score only</option>
+            </select>
+          </label>
+          <label for="ranking-model">
+            <span>Ranking model</span>
+            <select id="ranking-model">
+              <option value="">Top/current model</option>
+            </select>
+          </label>
+          <label for="saved-screen-select">
+            <span>Saved screen</span>
+            <select id="saved-screen-select">
+              <option value="">Loading saved screens...</option>
+            </select>
+          </label>
+          <label for="saved-screen-name">
+            <span>Screen name</span>
+            <input id="saved-screen-name" type="text" placeholder="High-confidence squeezes" />
+          </label>
+        </div>
+        <div class="action-row">
+          <button id="save-screen" type="button">Save current filters</button>
+          <button id="update-screen" class="secondary-button" type="button">Update saved screen</button>
+          <button id="delete-screen" class="secondary-button" type="button">Delete saved screen</button>
+          <span id="saved-screen-status" class="inline-status" aria-live="polite"></span>
+        </div>
+        <div class="watchlist-manager">
+          <div class="filter-grid roadmap-grid">
+            <label for="watchlist-select">
+              <span>Watchlist</span>
+              <select id="watchlist-select">
+                <option value="">Loading watchlists...</option>
+              </select>
+            </label>
+            <label for="watchlist-name">
+              <span>Watchlist name</span>
+              <input id="watchlist-name" type="text" placeholder="Momentum watchlist" />
+            </label>
+            <label for="watchlist-symbols" class="wide-control">
+              <span>Watchlist symbols</span>
+              <input id="watchlist-symbols" type="text" placeholder="GME, AMC, CVNA" />
+            </label>
+          </div>
+          <div class="action-row">
+            <button id="save-watchlist" type="button">Save watchlist</button>
+            <button id="scan-watchlist" class="secondary-button" type="button">Scan watchlist</button>
+            <button id="delete-watchlist" class="secondary-button" type="button">Delete watchlist</button>
+            <span id="watchlist-status" class="inline-status" aria-live="polite"></span>
+          </div>
+        </div>
+      </section>
       <section class="panel filter-panel" aria-labelledby="filters-title">
         <div class="filter-heading">
           <div>
@@ -95,6 +171,21 @@
       </section>
       <section id="summary" class="summary-grid"></section>
       <section id="results" class="results"></section>
+
+      <section class="roadmap-panels" aria-label="Roadmap feature panels">
+        <article class="panel roadmap-panel">
+          <h2>Alerts</h2>
+          <div id="alerts-panel-body" class="roadmap-panel-body">Loading alerts...</div>
+        </article>
+        <article class="panel roadmap-panel">
+          <h2>Scheduler</h2>
+          <div id="scheduler-panel-body" class="roadmap-panel-body">Loading schedules...</div>
+        </article>
+        <article class="panel roadmap-panel">
+          <h2>Reports &amp; history</h2>
+          <div id="reports-panel-body" class="roadmap-panel-body">Loading reports...</div>
+        </article>
+      </section>
 
       <section class="signal-guide" aria-labelledby="signal-guide-title">
         <div class="model-guide-intro panel">

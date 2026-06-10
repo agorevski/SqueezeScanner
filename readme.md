@@ -12,6 +12,8 @@ This is informational only and is not financial advice.
 - Recent screened stocks load automatically from the local cache when the page opens.
 - Search results append to the screened-stock list instead of replacing it.
 - Screened stocks can be filtered in the browser by top model, setup level, score, short interest, relative volume, and float size.
+- Scan responses can be ranked by top score, selected model score, confidence/delta fields when present, relative volume, short interest, float size, Hybrid, or Gamma Candidate.
+- Saved screens and watchlists are stored in the local SQLite app database.
 - Trash-can controls remove a screened ticker from both the page and the local SQLite cache.
 - Signal tiles and rationale bullets are color-coded by squeeze favorability: red, orange, yellow, green.
 - Model cards include hover/tap tooltips plus a bottom-of-page model guide explaining each category and calculation.
@@ -88,6 +90,7 @@ src/squeeze_scanner/
   config.py             .env loading and runtime settings
   domain.py             shared dataclasses, protocols, and errors
   providers/yahoo.py    yfinance/Yahoo Finance adapter
+  screens.py            SQLite saved screens and watchlists
   scoring.py            four-model metadata and scoring logic
   service.py            ticker normalization, scanning, and response shaping
   web.py                FastAPI app, routes, static assets, and templates
@@ -145,9 +148,37 @@ The frontend reads this metadata from `GET /api/model` and from the `model` bloc
 | `GET` | `/api/health` | Health check |
 | `GET` | `/api/model` | Current scoring model metadata used by the UI legend and tooltips |
 | `GET` | `/api/scans/recent` | Scores tickers screened within the last hour from latest cached raw snapshots |
+| `GET` | `/api/scans/history` | Queries stored historical score rows across symbols |
+| `GET` | `/api/scans/{symbol}/history` | Queries stored historical score rows for one symbol |
+| `GET` | `/api/scans/{symbol}/deltas` | Explains score changes for one symbol |
+| `POST` | `/api/scans/recompute` | Recomputes stored raw snapshots with the current scoring model |
 | `DELETE` | `/api/scans/{symbol}` | Deletes one ticker from the local cache so it disappears from the current UX |
 | `POST` | `/api/scan` | Scans requested tickers, using cached raw data unless stale |
 | `POST` | `/api/scan/most-shorted?count=100` | Loads Yahoo's predefined most-shorted universe and analyzes those tickers |
+| `GET`/`POST` | `/api/screens` | Lists or creates SQLite-backed saved screens with structured filter/ranking JSON |
+| `PUT`/`DELETE` | `/api/screens/{screen_id}` | Updates or deletes a saved screen |
+| `GET`/`POST` | `/api/watchlists` | Lists or creates SQLite-backed watchlists |
+| `PUT`/`DELETE` | `/api/watchlists/{watchlist_id}` | Updates or deletes a watchlist |
+| `GET`/`POST` | `/api/watchlists/{watchlist_id}/symbols` | Lists or adds watchlist symbols |
+| `DELETE` | `/api/watchlists/{watchlist_id}/symbols/{symbol}` | Removes a watchlist symbol |
+| `POST` | `/api/watchlists/{watchlist_id}/scan` | Scans all symbols in a watchlist |
+| `GET`/`POST` | `/api/scheduled-scans` | Lists or creates in-process scheduled scans |
+| `GET`/`PATCH`/`DELETE` | `/api/scheduled-scans/{schedule_id}` | Reads, updates, or deletes a scheduled scan |
+| `POST` | `/api/scheduled-scans/{schedule_id}/run` | Runs a schedule immediately |
+| `GET` | `/api/scheduled-scan-runs` | Lists scheduled scan run history |
+| `GET`/`POST` | `/api/alerts` | Lists or creates alert rules |
+| `PATCH`/`DELETE` | `/api/alerts/{alert_id}` | Updates or deletes an alert rule |
+| `GET` | `/api/alert-events` | Lists alert events |
+| `POST` | `/api/alert-events/{event_id}/ack` | Acknowledges an alert event |
+| `GET` | `/api/reports` | Lists historical report endpoints |
+| `GET` | `/api/reports/top-new-high-setups` | Reports new high setup rows |
+| `GET` | `/api/reports/biggest-1h-increases` | Reports biggest 1-hour score increases |
+| `GET` | `/api/reports/biggest-24h-increases` | Reports biggest 24-hour score increases |
+| `GET` | `/api/reports/repeated-high-setups` | Reports repeated high setup rows |
+| `GET` | `/api/reports/deterioration` | Reports score deterioration rows |
+| `GET` | `/api/reports/calibration` | Reports backtest calibration buckets |
+
+Scan endpoints accept optional `ranking_mode`, `selected_model`, and `sort_direction` fields or query parameters, depending on the endpoint.
 
 Example:
 

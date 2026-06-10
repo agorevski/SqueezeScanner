@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from dataclasses import asdict
+from datetime import datetime, timezone
 from typing import Any, Sequence
 
-from .domain import ScanResult, TickerSnapshot
+from .domain import GuardrailConfig, ScanResult, TickerSnapshot
 
 SCORING_MODEL_VERSION = "squeeze-v3"
 SCORE_MAX = 100.0
+DEFAULT_GUARDRAILS = GuardrailConfig()
 
 SCORING_MODELS: list[dict[str, Any]] = [
     {
@@ -194,6 +197,7 @@ def scoring_model_metadata() -> dict[str, Any]:
         "models": SCORING_MODELS,
         "model_weights": SCORING_MODEL_WEIGHTS,
         "signals": SCORING_SIGNALS,
+        "guardrails": asdict(DEFAULT_GUARDRAILS),
         "favorability_scale": [
             {"class": "signal-red", "label": "Red", "meaning": "Not favorable", "minimum_ratio": 0.0},
             {"class": "signal-orange", "label": "Orange", "meaning": "Somewhat favorable", "minimum_ratio": 0.25},
@@ -212,6 +216,8 @@ def score_snapshot(snapshot: TickerSnapshot) -> ScanResult:
     primary_model = max(model_scores, key=lambda model_key: model_scores[model_key])
     score = model_scores[primary_model]
     data_quality = _data_quality(snapshot)
+    risk_flags = _risk_flags(snapshot, data_quality)
+    model_confidence, confidence_rationales = _model_confidence(snapshot, risk_flags)
 
     warnings = list(snapshot.source_warnings)
     missing = _missing_core_fields(snapshot)
@@ -226,6 +232,8 @@ def score_snapshot(snapshot: TickerSnapshot) -> ScanResult:
         "volume": snapshot.volume,
         "avg_volume_20d": snapshot.avg_volume_20d,
         "relative_volume": _relative_volume(snapshot),
+        "dollar_volume": _dollar_volume(snapshot),
+        "avg_dollar_volume_20d": _avg_dollar_volume_20d(snapshot),
         "short_percent_float": snapshot.short_percent_float,
         "short_ratio": snapshot.short_ratio,
         "shares_short": snapshot.shares_short,
@@ -269,6 +277,12 @@ def score_snapshot(snapshot: TickerSnapshot) -> ScanResult:
         components=rounded_components[primary_model],
         rationale=_build_summary_rationale(snapshot, rounded_components[primary_model]),
         warnings=warnings,
+        field_sources=dict(snapshot.field_sources),
+        field_quality=dict(snapshot.field_quality),
+        source_quality=dict(snapshot.source_quality),
+        model_confidence=model_confidence,
+        confidence_rationales=confidence_rationales,
+        risk_flags=risk_flags,
     )
 
 
@@ -482,6 +496,506 @@ def _risk_level(score: float, data_quality: float) -> str:
     return "Low"
 
 
+def _risk_flags(
+    snapshot: TickerSnapshot,
+    data_quality: float,
+    guardrails: GuardrailConfig = DEFAULT_GUARDRAILS,
+) -> list[dict[str, Any]]:
+    flags: list[dict[str, Any]] = []
+    low_liquidity_reasons: list[str] = []
+
+    if snapshot.price is None:
+        flags.append(_guardrail_flag("missing_price", "high", "Price is missing; score reliability is limited."))
+    else:
+        if snapshot.price < guardrails.min_price:
+            flags.append(
+                _guardrail_flag(
+                    "price_below_min",
+                    "high",
+                    f"Price is below the ${guardrails.min_price:.2f} guardrail.",
+                    value=snapshot.price,
+                    limit=guardrails.min_price,
+                    field="price",
+                )
+            )
+        if snapshot.price > guardrails.max_price:
+            flags.append(
+                _guardrail_flag(
+                    "price_above_max",
+                    "warning",
+                    f"Price is above the ${guardrails.max_price:.2f} squeeze guardrail.",
+                    value=snapshot.price,
+                    limit=guardrails.max_price,
+                    field="price",
+                )
+            )
+
+    dollar_volume = _dollar_volume(snapshot)
+    if dollar_volume is None:
+        flags.append(
+            _guardrail_flag(
+                "missing_dollar_volume",
+                "warning",
+                "Dollar volume cannot be calculated because price or volume is missing.",
+            )
+        )
+    elif dollar_volume < guardrails.min_dollar_volume:
+        low_liquidity_reasons.append("current dollar volume")
+        flags.append(
+            _guardrail_flag(
+                "low_dollar_volume",
+                "high",
+                "Current dollar volume is below the liquidity guardrail.",
+                value=dollar_volume,
+                limit=guardrails.min_dollar_volume,
+                field="dollar_volume",
+            )
+        )
+
+    if snapshot.avg_volume_20d is None:
+        flags.append(
+            _guardrail_flag(
+                "missing_average_volume",
+                "warning",
+                "20-day average volume is missing.",
+                field="avg_volume_20d",
+            )
+        )
+    elif snapshot.avg_volume_20d < guardrails.min_avg_volume_20d:
+        low_liquidity_reasons.append("average share volume")
+        flags.append(
+            _guardrail_flag(
+                "low_average_volume",
+                "warning",
+                "20-day average volume is below the liquidity guardrail.",
+                value=snapshot.avg_volume_20d,
+                limit=guardrails.min_avg_volume_20d,
+                field="avg_volume_20d",
+            )
+        )
+
+    avg_dollar_volume = _avg_dollar_volume_20d(snapshot)
+    if avg_dollar_volume is None:
+        flags.append(
+            _guardrail_flag(
+                "missing_average_dollar_volume",
+                "warning",
+                "Average dollar volume cannot be calculated because price or average volume is missing.",
+            )
+        )
+    elif avg_dollar_volume < guardrails.min_avg_dollar_volume_20d:
+        low_liquidity_reasons.append("average dollar volume")
+        flags.append(
+            _guardrail_flag(
+                "low_average_dollar_volume",
+                "high",
+                "20-day average dollar volume is below the liquidity guardrail.",
+                value=avg_dollar_volume,
+                limit=guardrails.min_avg_dollar_volume_20d,
+                field="avg_dollar_volume_20d",
+            )
+        )
+
+    if low_liquidity_reasons:
+        flags.append(
+            _guardrail_flag(
+                "low_liquidity",
+                "high",
+                f"Low liquidity guardrail triggered by {', '.join(sorted(set(low_liquidity_reasons)))}.",
+            )
+        )
+
+    if snapshot.market_cap is None:
+        flags.append(_guardrail_flag("missing_market_cap", "warning", "Market cap is missing."))
+    else:
+        if snapshot.market_cap < guardrails.min_market_cap:
+            flags.append(
+                _guardrail_flag(
+                    "low_market_cap",
+                    "high",
+                    "Market cap is below the risk guardrail.",
+                    value=snapshot.market_cap,
+                    limit=guardrails.min_market_cap,
+                    field="market_cap",
+                )
+            )
+        if snapshot.market_cap > guardrails.max_squeeze_market_cap:
+            flags.append(
+                _guardrail_flag(
+                    "large_market_cap",
+                    "info",
+                    "Market cap is above the default range where squeeze-style setups are most sensitive.",
+                    value=snapshot.market_cap,
+                    limit=guardrails.max_squeeze_market_cap,
+                    field="market_cap",
+                )
+            )
+
+    missing = _missing_core_fields(snapshot)
+    if missing:
+        excessive = len(missing) > guardrails.max_missing_core_fields
+        flags.append(
+            _guardrail_flag(
+                "excessive_missing_data" if excessive else "missing_data",
+                "high" if excessive else "warning",
+                f"{len(missing)} core field(s) are missing: {', '.join(missing)}.",
+                value=float(len(missing)),
+                limit=float(guardrails.max_missing_core_fields),
+            )
+        )
+
+    if snapshot.recent_reverse_split is True:
+        days_since = snapshot.days_since_reverse_split
+        if days_since is None or days_since <= guardrails.recent_reverse_split_days:
+            flags.append(
+                _guardrail_flag(
+                    "recent_reverse_split",
+                    "high",
+                    "Recent reverse split detected; float-compression setups may carry elevated dilution/listing risk.",
+                    value=days_since,
+                    limit=guardrails.recent_reverse_split_days,
+                    field="days_since_reverse_split",
+                )
+            )
+    elif snapshot.recent_reverse_split is None:
+        flags.append(
+            _guardrail_flag(
+                "corporate_actions_unknown",
+                "warning",
+                "Corporate-action history is unavailable, so reverse-split and dilution risks may be incomplete.",
+            )
+        )
+
+    if snapshot.source_warnings:
+        flags.append(
+            _guardrail_flag(
+                "source_warnings",
+                "warning",
+                f"{len(snapshot.source_warnings)} source warning(s) were reported.",
+            )
+        )
+
+    if data_quality < 50:
+        flags.append(
+            _guardrail_flag(
+                "low_data_quality",
+                "warning",
+                "Overall data quality is below 50%.",
+                value=data_quality,
+                limit=50.0,
+            )
+        )
+
+    return flags
+
+
+def _guardrail_flag(
+    key: str,
+    severity: str,
+    message: str,
+    *,
+    value: float | bool | None = None,
+    limit: float | None = None,
+    field: str | None = None,
+) -> dict[str, Any]:
+    flag: dict[str, Any] = {
+        "key": key,
+        "severity": severity,
+        "message": message,
+    }
+    if value is not None:
+        flag["value"] = _round_metric(value)
+    if limit is not None:
+        flag["limit"] = _round_metric(limit)
+    if field is not None:
+        flag["field"] = field
+    return flag
+
+
+def _model_confidence(
+    snapshot: TickerSnapshot,
+    risk_flags: Sequence[dict[str, Any]],
+) -> tuple[dict[str, float], dict[str, list[str]]]:
+    classical, classical_rationale = _classical_confidence(snapshot)
+    float_score, float_rationale = _float_confidence(snapshot)
+    gamma, gamma_rationale = _gamma_confidence(snapshot)
+
+    classical, classical_rationale = _apply_common_confidence_adjustments(
+        snapshot,
+        risk_flags,
+        classical,
+        classical_rationale,
+    )
+    float_score, float_rationale = _apply_common_confidence_adjustments(
+        snapshot,
+        risk_flags,
+        float_score,
+        float_rationale,
+    )
+    gamma, gamma_rationale = _apply_common_confidence_adjustments(
+        snapshot,
+        risk_flags,
+        gamma,
+        gamma_rationale,
+    )
+
+    hybrid_blend = classical * 0.35 + float_score * 0.35 + gamma * 0.30
+    hybrid_cap = min(classical, float_score, gamma) + 30.0
+    hybrid = round(max(0.0, min(100.0, hybrid_blend, hybrid_cap)), 1)
+    hybrid_rationale = [
+        "Hybrid confidence blends short, float/corporate-action, and options confidence.",
+        f"Component confidence: classical {classical:.1f}, float {float_score:.1f}, gamma {gamma:.1f}.",
+    ]
+    if hybrid < hybrid_blend:
+        hybrid_rationale.append("Hybrid confidence capped because one required signal domain is weak.")
+
+    model_confidence = {
+        "classical_short_squeeze": classical,
+        "float_compression": float_score,
+        "gamma_candidate": gamma,
+        "hybrid": hybrid,
+    }
+    confidence_rationales = {
+        "classical_short_squeeze": classical_rationale,
+        "float_compression": float_rationale,
+        "gamma_candidate": gamma_rationale,
+        "hybrid": hybrid_rationale,
+    }
+    return model_confidence, confidence_rationales
+
+
+def _classical_confidence(snapshot: TickerSnapshot) -> tuple[float, list[str]]:
+    score = 0.0
+    rationales: list[str] = []
+    for field_name, weight, label, optional in (
+        ("short_percent_float", 25.0, "short interest", False),
+        ("short_ratio", 20.0, "days to cover", False),
+        ("price", 5.0, "price", False),
+        ("volume", 10.0, "current volume", False),
+        ("avg_volume_20d", 10.0, "20-day average volume", False),
+        ("borrow_fee_pct", 20.0, "borrow fee", True),
+    ):
+        contribution, field_rationales = _confidence_field(
+            snapshot,
+            field_name,
+            weight,
+            label,
+            optional=optional,
+        )
+        score += contribution
+        rationales.extend(field_rationales)
+
+    contribution, field_rationales = _float_or_market_cap_confidence(snapshot, 10.0)
+    score += contribution
+    rationales.extend(field_rationales)
+    if not rationales:
+        rationales.append("Required short-interest, volume, float, and borrow fields are available.")
+    return round(min(100.0, score), 1), rationales
+
+
+def _float_confidence(snapshot: TickerSnapshot) -> tuple[float, list[str]]:
+    score = 0.0
+    rationales: list[str] = []
+    contribution, field_rationales = _float_or_market_cap_confidence(snapshot, 30.0)
+    score += contribution
+    rationales.extend(field_rationales)
+
+    for field_name, weight, label, optional in (
+        ("recent_reverse_split", 20.0, "corporate-action history", False),
+        ("price", 10.0, "price", False),
+        ("volume", 10.0, "current volume", False),
+        ("avg_volume_20d", 15.0, "20-day average volume", False),
+        ("market_cap", 5.0, "market cap", True),
+        ("change_5d_pct", 5.0, "5-day momentum", True),
+        ("change_20d_pct", 5.0, "20-day momentum", True),
+    ):
+        contribution, field_rationales = _confidence_field(
+            snapshot,
+            field_name,
+            weight,
+            label,
+            optional=optional,
+        )
+        score += contribution
+        rationales.extend(field_rationales)
+
+    if not rationales:
+        rationales.append("Float, corporate-action, liquidity, and momentum fields are available.")
+    return round(min(100.0, score), 1), rationales
+
+
+def _gamma_confidence(snapshot: TickerSnapshot) -> tuple[float, list[str]]:
+    score = 0.0
+    rationales: list[str] = []
+    for field_name, weight, label, optional in (
+        ("price", 10.0, "underlying price", False),
+        ("call_volume", 20.0, "call volume", False),
+        ("put_volume", 10.0, "put volume", True),
+        ("call_open_interest", 15.0, "call open interest", False),
+        ("put_open_interest", 5.0, "put open interest", True),
+        ("dealer_gamma_exposure_proxy", 20.0, "dealer gamma exposure", False),
+        ("market_cap", 10.0, "market cap", True),
+        ("avg_volume_20d", 10.0, "20-day average volume", True),
+    ):
+        contribution, field_rationales = _confidence_field(
+            snapshot,
+            field_name,
+            weight,
+            label,
+            optional=optional,
+        )
+        score += contribution
+        rationales.extend(field_rationales)
+
+    if snapshot.dealer_gamma_exposure_proxy is not None and _field_status(snapshot, "dealer_gamma_exposure_proxy") == "estimated":
+        rationales.append("Gamma exposure is a public-data proxy rather than true dealer positioning.")
+    if not rationales:
+        rationales.append("Options volume, open-interest, exposure, and liquidity fields are available.")
+    return round(min(100.0, score), 1), rationales
+
+
+def _float_or_market_cap_confidence(
+    snapshot: TickerSnapshot,
+    weight: float,
+) -> tuple[float, list[str]]:
+    if snapshot.float_shares is not None and _field_status(snapshot, "float_shares") not in {
+        "missing",
+        "provider-error",
+    }:
+        return _confidence_field(snapshot, "float_shares", weight, "float shares")
+    if snapshot.market_cap is not None and _field_status(snapshot, "market_cap") not in {
+        "missing",
+        "provider-error",
+    }:
+        contribution, rationales = _confidence_field(snapshot, "market_cap", weight * 0.65, "market cap")
+        rationales.append("Market cap is used as a weaker float proxy.")
+        return contribution, rationales
+    return 0.0, ["float shares and market cap are missing"]
+
+
+def _confidence_field(
+    snapshot: TickerSnapshot,
+    field_name: str,
+    weight: float,
+    label: str,
+    *,
+    optional: bool = False,
+) -> tuple[float, list[str]]:
+    value = getattr(snapshot, field_name)
+    status = _field_status(snapshot, field_name)
+    if value is None or status in {"missing", "provider-error"}:
+        optional_text = " optional" if optional else ""
+        return 0.0, [f"{label} missing;{optional_text} data gap reduces confidence"]
+
+    multiplier = _field_quality_multiplier(status)
+    rationales: list[str] = []
+    if status == "estimated":
+        rationales.append(f"{label} is estimated rather than directly sourced")
+    elif status == "stale":
+        rationales.append(f"{label} is marked stale")
+
+    source_multiplier, source_rationale = _source_quality_multiplier(snapshot, field_name, label)
+    if source_rationale is not None:
+        rationales.append(source_rationale)
+
+    return weight * multiplier * source_multiplier, rationales
+
+
+def _field_status(snapshot: TickerSnapshot, field_name: str) -> str:
+    status = snapshot.field_quality.get(field_name)
+    if isinstance(status, str) and status.strip():
+        return status.strip().lower()
+    return "missing" if getattr(snapshot, field_name) is None else "present"
+
+
+def _field_quality_multiplier(status: str) -> float:
+    if status == "estimated":
+        return 0.65
+    if status == "stale":
+        return 0.5
+    if status in {"provider-error", "missing"}:
+        return 0.0
+    return 1.0
+
+
+def _source_quality_multiplier(
+    snapshot: TickerSnapshot,
+    field_name: str,
+    label: str,
+) -> tuple[float, str | None]:
+    source = snapshot.field_sources.get(field_name)
+    if not source:
+        return 1.0, None
+    source_quality = snapshot.source_quality.get(source)
+    if source_quality is None:
+        return 1.0, None
+    if source_quality < 50:
+        return 0.8, f"{label} source quality is low ({source_quality:.0f}/100)"
+    if source_quality < 75:
+        return 0.92, f"{label} source quality is medium ({source_quality:.0f}/100)"
+    return 1.0, None
+
+
+def _apply_common_confidence_adjustments(
+    snapshot: TickerSnapshot,
+    risk_flags: Sequence[dict[str, Any]],
+    score: float,
+    rationales: list[str],
+) -> tuple[float, list[str]]:
+    adjusted = score
+    additions = list(rationales)
+
+    freshness_penalty, freshness_rationale = _freshness_penalty(snapshot)
+    adjusted -= freshness_penalty
+    if freshness_rationale is not None:
+        additions.append(freshness_rationale)
+
+    if snapshot.source_warnings:
+        warning_penalty = min(15.0, 5.0 + (len(snapshot.source_warnings) - 1) * 2.0)
+        adjusted -= warning_penalty
+        additions.append("Source warnings reduce confidence.")
+
+    risk_keys = {str(flag.get("key")) for flag in risk_flags}
+    if "low_liquidity" in risk_keys:
+        adjusted -= 15.0
+        additions.append("Low liquidity guardrail reduces confidence.")
+    elif {"missing_dollar_volume", "missing_average_dollar_volume"} & risk_keys:
+        adjusted -= 8.0
+        additions.append("Incomplete liquidity data reduces confidence.")
+
+    if "excessive_missing_data" in risk_keys:
+        adjusted -= 10.0
+        additions.append("Excessive missing data reduces confidence.")
+
+    return round(max(0.0, min(100.0, adjusted)), 1), additions
+
+
+def _freshness_penalty(snapshot: TickerSnapshot) -> tuple[float, str | None]:
+    if not snapshot.source_fetched_at:
+        return 3.0, "Source timestamp unavailable."
+    fetched_at = _parse_source_datetime(snapshot.source_fetched_at)
+    if fetched_at is None:
+        return 5.0, "Source timestamp could not be parsed."
+    age_hours = max(0.0, (datetime.now(timezone.utc) - fetched_at).total_seconds() / 3600.0)
+    if age_hours > 48:
+        return 15.0, f"Source data is stale ({age_hours:.1f} hours old)."
+    if age_hours > 24:
+        return 10.0, f"Source data is older than 24 hours ({age_hours:.1f} hours old)."
+    if age_hours > 6:
+        return 5.0, f"Source data is older than 6 hours ({age_hours:.1f} hours old)."
+    return 0.0, None
+
+
+def _parse_source_datetime(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def _data_quality(snapshot: TickerSnapshot) -> float:
     fields = [
         snapshot.price,
@@ -613,6 +1127,18 @@ def _relative_volume(snapshot: TickerSnapshot) -> float | None:
     if snapshot.volume is None or snapshot.avg_volume_20d is None or snapshot.avg_volume_20d <= 0:
         return None
     return snapshot.volume / snapshot.avg_volume_20d
+
+
+def _dollar_volume(snapshot: TickerSnapshot) -> float | None:
+    if snapshot.price is None or snapshot.volume is None:
+        return None
+    return snapshot.price * snapshot.volume
+
+
+def _avg_dollar_volume_20d(snapshot: TickerSnapshot) -> float | None:
+    if snapshot.price is None or snapshot.avg_volume_20d is None:
+        return None
+    return snapshot.price * snapshot.avg_volume_20d
 
 
 def _short_interest_change(snapshot: TickerSnapshot) -> float | None:

@@ -218,6 +218,51 @@ button:disabled {
   font-size: 0.92rem;
 }
 
+.roadmap-control-panel {
+  margin: 18px 0 0;
+}
+
+.roadmap-grid {
+  align-items: end;
+}
+
+.wide-control {
+  grid-column: span 2;
+}
+
+.action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  margin-top: 14px;
+}
+
+.action-row button {
+  min-height: 44px;
+  padding: 10px 16px;
+}
+
+.inline-status,
+.muted {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.inline-status.success {
+  color: var(--success);
+}
+
+.inline-status.error {
+  color: var(--danger);
+}
+
+.watchlist-manager {
+  margin-top: 20px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
+}
+
 .status {
   margin: 18px 0;
   color: var(--muted);
@@ -315,6 +360,94 @@ tr:last-child td {
   background: var(--muted);
 }
 
+.delta-chip,
+.confidence-badge,
+.risk-badge {
+  display: inline-flex;
+  width: max-content;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: rgba(151, 166, 188, 0.12);
+  color: var(--muted);
+  font-size: 0.76rem;
+  font-weight: 800;
+}
+
+.delta-chip.positive {
+  border-color: rgba(52, 211, 153, 0.5);
+  background: rgba(52, 211, 153, 0.12);
+  color: var(--success);
+}
+
+.delta-chip.negative,
+.risk-badge.high,
+.risk-badge.critical {
+  border-color: rgba(251, 113, 133, 0.55);
+  background: rgba(251, 113, 133, 0.14);
+  color: var(--danger);
+}
+
+.delta-chip.neutral,
+.confidence-badge.unavailable {
+  color: var(--muted);
+}
+
+.confidence-badge {
+  margin-top: 8px;
+  border-color: rgba(125, 211, 252, 0.45);
+  background: rgba(125, 211, 252, 0.12);
+  color: var(--accent);
+}
+
+.model-score-tile .confidence-badge,
+td .confidence-badge {
+  color: var(--accent);
+}
+
+.confidence-badge.high {
+  border-color: rgba(52, 211, 153, 0.5);
+  background: rgba(52, 211, 153, 0.12);
+  color: var(--success);
+}
+
+.model-score-tile .confidence-badge.high,
+td .confidence-badge.high {
+  color: var(--success);
+}
+
+.confidence-badge.low {
+  border-color: rgba(251, 113, 133, 0.45);
+  background: rgba(251, 113, 133, 0.12);
+  color: var(--danger);
+}
+
+.model-score-tile .confidence-badge.low,
+td .confidence-badge.low {
+  color: var(--danger);
+}
+
+.model-score-tile .confidence-badge.unavailable,
+td .confidence-badge.unavailable {
+  color: var(--muted);
+}
+
+.risk-badge.warning,
+.risk-badge.medium {
+  border-color: rgba(251, 191, 36, 0.55);
+  background: rgba(251, 191, 36, 0.14);
+  color: var(--warning);
+}
+
+.risk-badge.info,
+.risk-badge.low {
+  border-color: rgba(125, 211, 252, 0.45);
+  background: rgba(125, 211, 252, 0.12);
+  color: var(--accent);
+}
+
 .positive {
   color: var(--success);
 }
@@ -390,6 +523,47 @@ tr:last-child td {
 .component-grid {
   grid-template-columns: repeat(3, minmax(0, 1fr));
   margin: 18px 0;
+}
+
+.delta-grid,
+.risk-section {
+  display: grid;
+  gap: 10px;
+  margin: 16px 0;
+}
+
+.delta-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.delta-card,
+.risk-section {
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: rgba(11, 20, 36, 0.7);
+}
+
+.delta-card > span,
+.risk-section > span {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.risk-flags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.risk-section p {
+  margin: 8px 0 0;
+  color: var(--muted);
+  line-height: 1.45;
 }
 
 .component-grid div,
@@ -574,6 +748,46 @@ tr:last-child td {
   font-size: 0.9rem;
 }
 
+.roadmap-panels {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+  margin-top: 22px;
+}
+
+.roadmap-panel h2 {
+  margin: 0 0 10px;
+}
+
+.roadmap-panel-body {
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.roadmap-list {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.roadmap-list li {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: rgba(11, 20, 36, 0.65);
+}
+
+.roadmap-list strong,
+.roadmap-list span {
+  display: block;
+}
+
+.roadmap-list small {
+  color: var(--muted);
+}
+
 .signal-guide {
   margin-top: 24px;
 }
@@ -646,8 +860,14 @@ tr:last-child td {
   .filter-heading,
   .filter-grid,
   .summary-grid,
-  .cards {
+  .cards,
+  .delta-grid,
+  .roadmap-panels {
     grid-template-columns: 1fr;
+  }
+
+  .wide-control {
+    grid-column: auto;
   }
 
   .filter-heading {

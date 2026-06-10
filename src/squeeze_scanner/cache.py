@@ -4,15 +4,25 @@ import json
 import logging
 import sqlite3
 import time
-from dataclasses import asdict, fields
+from dataclasses import MISSING, asdict, dataclass, fields
 from pathlib import Path
 from threading import Lock
-from typing import Callable
+from typing import Any, Callable
 
 from .config import DEFAULT_CACHE_TTL_SECONDS
 from .domain import MarketDataProvider, TickerSnapshot
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RawSnapshotRecord:
+    id: int
+    provider: str
+    symbol: str
+    fetched_at: float
+    scanned_at: float | None
+    snapshot: TickerSnapshot
 
 
 class CachedMarketDataProvider:
@@ -97,6 +107,95 @@ class CachedMarketDataProvider:
             ).fetchall()
 
         return {row["symbol"]: float(row["scanned_at"]) for row in rows}
+
+    def raw_history_references(self, symbols: list[str]) -> dict[str, dict[str, Any]]:
+        self._ensure_schema()
+        unique_symbols = list(dict.fromkeys(symbols))
+        if not unique_symbols:
+            return {}
+
+        placeholders = ", ".join("?" for _ in unique_symbols)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    cache.symbol,
+                    cache.provider,
+                    cache.fetched_at AS raw_fetched_at,
+                    history.id AS raw_history_id
+                FROM market_data_cache AS cache
+                LEFT JOIN market_data_history AS history
+                  ON history.provider = cache.provider
+                 AND history.symbol = cache.symbol
+                 AND history.fetched_at = cache.fetched_at
+                WHERE cache.provider = ? AND cache.symbol IN ({placeholders})
+                """,
+                (self.provider_name, *unique_symbols),
+            ).fetchall()
+
+        return {
+            row["symbol"]: {
+                "provider": row["provider"],
+                "raw_history_id": row["raw_history_id"],
+                "raw_fetched_at": float(row["raw_fetched_at"]),
+            }
+            for row in rows
+        }
+
+    def historical_snapshots(
+        self,
+        *,
+        symbols: list[str] | None = None,
+        from_timestamp: float | None = None,
+        to_timestamp: float | None = None,
+        limit: int = 100,
+    ) -> list[RawSnapshotRecord]:
+        self._ensure_schema()
+        clauses = ["provider = ?"]
+        params: list[Any] = [self.provider_name]
+        if symbols:
+            unique_symbols = list(dict.fromkeys(symbols))
+            placeholders = ", ".join("?" for _ in unique_symbols)
+            clauses.append(f"symbol IN ({placeholders})")
+            params.extend(unique_symbols)
+        if from_timestamp is not None:
+            clauses.append("fetched_at >= ?")
+            params.append(float(from_timestamp))
+        if to_timestamp is not None:
+            clauses.append("fetched_at <= ?")
+            params.append(float(to_timestamp))
+        params.append(max(1, min(int(limit), 1_000)))
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT id, provider, symbol, fetched_at, scanned_at, payload_json
+                FROM market_data_history
+                WHERE {' AND '.join(clauses)}
+                ORDER BY fetched_at DESC, id DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+
+        records: list[RawSnapshotRecord] = []
+        for row in rows:
+            try:
+                snapshot = snapshot_from_json(row["payload_json"])
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                logger.warning("Ignoring corrupt historical market data for %s: %s", row["symbol"], exc)
+                continue
+            records.append(
+                RawSnapshotRecord(
+                    id=int(row["id"]),
+                    provider=row["provider"],
+                    symbol=row["symbol"],
+                    fetched_at=float(row["fetched_at"]),
+                    scanned_at=float(row["scanned_at"]) if row["scanned_at"] is not None else None,
+                    snapshot=snapshot,
+                )
+            )
+        return records
 
     def delete(self, symbol: str) -> bool:
         self._ensure_schema()
@@ -275,11 +374,30 @@ def snapshot_from_json(payload_json: str) -> TickerSnapshot:
     if not isinstance(payload, dict):
         raise ValueError("cached payload must be a JSON object")
 
-    field_names = {field.name for field in fields(TickerSnapshot)}
-    snapshot_payload = {name: payload.get(name) for name in field_names}
+    snapshot_payload: dict[str, object] = {}
+    for snapshot_field in fields(TickerSnapshot):
+        if snapshot_field.name in payload:
+            value = payload.get(snapshot_field.name)
+        elif snapshot_field.default is not MISSING:
+            value = snapshot_field.default
+        elif snapshot_field.default_factory is not MISSING:
+            value = snapshot_field.default_factory()
+        else:
+            value = None
+
+        if value is None and snapshot_field.default_factory is not MISSING:
+            value = snapshot_field.default_factory()
+        snapshot_payload[snapshot_field.name] = value
+
     if not isinstance(snapshot_payload["symbol"], str) or not snapshot_payload["symbol"]:
         raise ValueError("cached payload is missing symbol")
     if not isinstance(snapshot_payload["source_warnings"], list):
         snapshot_payload["source_warnings"] = []
+    if not isinstance(snapshot_payload["field_sources"], dict):
+        snapshot_payload["field_sources"] = {}
+    if not isinstance(snapshot_payload["field_quality"], dict):
+        snapshot_payload["field_quality"] = {}
+    if not isinstance(snapshot_payload["source_quality"], dict):
+        snapshot_payload["source_quality"] = {}
 
     return TickerSnapshot(**snapshot_payload)

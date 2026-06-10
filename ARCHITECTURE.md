@@ -7,10 +7,12 @@ flowchart LR
 
     subgraph WebApp["SqueezeScanner application"]
         UI["HTML/CSS/JS<br/>src/squeeze_scanner/templates<br/>src/squeeze_scanner/static"]
-        API["FastAPI routes<br/>/api/model<br/>/api/scan<br/>/api/scan/most-shorted<br/>/api/scans/recent<br/>DELETE /api/scans/{symbol}<br/>/api/health"]
+        API["FastAPI routes<br/>/api/model<br/>/api/providers<br/>/api/scan<br/>/api/scan/most-shorted<br/>/api/scans/recent<br/>DELETE /api/scans/{symbol}<br/>/api/health"]
         Scanner["ScannerService<br/>four-model score recomputation"]
         CacheProvider["CachedMarketDataProvider<br/>1 hour TTL"]
+        CompositeProvider["CompositeMarketDataProvider<br/>optional premium feed overlays"]
         YahooProvider["YahooFinanceProvider<br/>yfinance adapter"]
+        PremiumProviders["Optional premium providers<br/>borrow, short interest,<br/>corporate actions, filings,<br/>halt/news/events"]
     end
 
     Uvicorn --> UI
@@ -19,7 +21,9 @@ flowchart LR
     Scanner --> CacheProvider
     API -->|"recent cached snapshots"| CacheProvider
     CacheProvider --> SQLite[("SQLite<br/>data/market_data_cache.sqlite3<br/>latest raw snapshots<br/>historical raw snapshots")]
-    CacheProvider -->|"cache miss or >1 hr stale"| YahooProvider
+    CacheProvider -->|"cache miss or >1 hr stale"| CompositeProvider
+    CompositeProvider --> YahooProvider
+    CompositeProvider -.-> PremiumProviders
     YahooProvider --> Yahoo["Yahoo Finance<br/>market data"]
 ```
 
@@ -70,14 +74,18 @@ sequenceDiagram
 ## Key design points
 
 - `uv` manages dependencies and the `squeeze-scanner` console script.
-- Network binding, port, reload mode, cache path, and cache TTL are configured through `.env`; `.env.example` documents the supported variables.
+- Network binding, port, reload mode, cache path, cache TTL, and optional provider selections are configured through `.env`; `.env.example` documents the supported variables.
 - Source code, templates, and static assets live under `src/squeeze_scanner`; legacy `app.*` modules are compatibility shims.
 - Uvicorn auto-reload can watch `src/squeeze_scanner` during development.
 - Browser, static, and API responses use `Cache-Control: no-store` to prevent stale UI assets.
 - The frontend gets model definitions, signal labels, weights, descriptions, calculations, tooltips, and legend data from the Python scoring model via `/api/model` and each response `model` block.
 - The frontend keeps scanned results in memory and applies model/indicator filters client-side, so filtering changes only the visible table/cards and does not delete cached data.
 - SQLite stores latest raw financial-service snapshots plus historical raw snapshots with `fetched_at` and `scanned_at` timestamps. Scores, risk labels, components, rationale, and rendered UI state are never cached.
+- Option-chain records and true/proxy gamma aggregates live in raw snapshot/score-history JSON. Yahoo-derived exposure stays in `dealer_gamma_exposure_proxy`; provider-backed greeks populate separate true-GEX fields.
 - `/api/scans/recent` returns all tickers screened within the current TTL and recomputes their scores with the current model.
 - `DELETE /api/scans/{symbol}` removes one ticker from the SQLite cache; the frontend also removes it from the visible screened list.
-- `/api/scan` uses cached raw data for fresh symbols and fetches Yahoo Finance only for new or stale symbols.
+- `/api/providers` exposes default Yahoo status plus optional premium provider capability/status metadata without exposing credentials.
+- `/api/scan` uses cached raw data for fresh symbols and fetches Yahoo Finance only for new or stale symbols unless optional premium providers are explicitly selected.
 - `/api/scan/most-shorted` pulls Yahoo's predefined most-shorted screener symbols, then analyzes them through the same scanner/cache path.
+- Screens, watchlists, schedules, and alerts support optional `owner_id` metadata and filters for external auth integration while local mode remains unauthenticated.
+- `/api/health`, `/api/status`, and `/api/scheduler/status` expose storage, cache, provider, scheduler, automation, and owner-scoping readiness for local operations.

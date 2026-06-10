@@ -59,7 +59,18 @@ curl "${BASE_URL}/api/health"
 Expected response:
 
 ```json
-{"status":"ok"}
+{
+  "status": "ok",
+  "storage": {"backend": "sqlite", "accessible": true},
+  "scheduler": {"enabled": true, "mode": "in_process"}
+}
+```
+
+For deeper scheduler/cache/provider details:
+
+```bash
+curl -fsS "${BASE_URL}/api/status" | python3 -m json.tool
+curl -fsS "${BASE_URL}/api/scheduler/status" | python3 -m json.tool
 ```
 
 Check the homepage:

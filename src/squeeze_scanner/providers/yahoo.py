@@ -5,10 +5,21 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 
-from squeeze_scanner.domain import DataProviderError, ScreenerError, TickerSnapshot
+from squeeze_scanner.domain import DataProviderError, OptionProviderCapabilities, ScreenerError, TickerSnapshot
 
 MOST_SHORTED_SCREENER = "most_shorted_stocks"
 MAX_SCREENER_COUNT = 250
+YAHOO_OPTION_SOURCE = "yahoo_finance_options_proxy"
+YAHOO_OPTION_STALE_AFTER_SECONDS = 3_600.0
+YAHOO_OPTION_CAPABILITIES = OptionProviderCapabilities(
+    expiration_listing=True,
+    strike_listing=True,
+    bid_ask=True,
+    last_price=True,
+    volume=True,
+    open_interest=True,
+    implied_volatility=True,
+).to_dict()
 
 
 class YahooFinanceProvider:
@@ -73,9 +84,10 @@ class YahooFinanceProvider:
         if price is not None and fifty_two_week_high and fifty_two_week_high > 0:
             distance_from_high = ((price / fifty_two_week_high) - 1.0) * 100.0
 
+        fetched_at = datetime.now(timezone.utc).isoformat()
         reverse_split_metrics, reverse_split_warnings = _reverse_split_metrics(ticker)
         warnings.extend(reverse_split_warnings)
-        options_metrics, options_warnings = _options_metrics(ticker, price)
+        options_metrics, options_warnings = _options_metrics(ticker, price, fetched_at=fetched_at)
         warnings.extend(options_warnings)
 
         data_fields = {
@@ -99,6 +111,12 @@ class YahooFinanceProvider:
             "call_open_interest": options_metrics["call_open_interest"],
             "put_open_interest": options_metrics["put_open_interest"],
             "dealer_gamma_exposure_proxy": options_metrics["dealer_gamma_exposure_proxy"],
+            "option_chain_source": options_metrics["option_chain_source"],
+            "option_chain_provider": options_metrics["option_chain_provider"],
+            "option_chain_fetched_at": options_metrics["option_chain_fetched_at"],
+            "option_chain_freshness_seconds": options_metrics["option_chain_freshness_seconds"],
+            "option_chain_stale_after_seconds": options_metrics["option_chain_stale_after_seconds"],
+            "option_chain_capabilities": options_metrics["option_chain_capabilities"],
             "change_1d_pct": _pct_change(price, previous_close),
             "change_5d_pct": _history_pct_change(close_values, 5),
             "change_20d_pct": _history_pct_change(close_values, 20),
@@ -109,7 +127,7 @@ class YahooFinanceProvider:
             symbol=symbol,
             company_name=_first_text(info, "shortName", "longName", "displayName"),
             **data_fields,
-            source_fetched_at=datetime.now(timezone.utc).isoformat(),
+            source_fetched_at=fetched_at,
             field_sources=_field_sources(data_fields),
             field_quality=_field_quality(data_fields),
             source_quality={
@@ -174,11 +192,11 @@ def _symbols_from_quotes(quotes: Sequence[Mapping[str, Any]]) -> list[str]:
 def _field_sources(data_fields: Mapping[str, Any]) -> dict[str, str]:
     sources: dict[str, str] = {}
     for field_name, value in data_fields.items():
-        if value is None:
+        if not _has_value(value):
             continue
         sources[field_name] = (
-            "yahoo_finance_options_proxy"
-            if field_name == "dealer_gamma_exposure_proxy"
+            YAHOO_OPTION_SOURCE
+            if field_name in _option_proxy_fields()
             else "yahoo_finance"
         )
     return sources
@@ -188,13 +206,33 @@ def _field_quality(data_fields: Mapping[str, Any]) -> dict[str, str]:
     estimated_fields = {"dealer_gamma_exposure_proxy"}
     quality: dict[str, str] = {}
     for field_name, value in data_fields.items():
-        if value is None:
+        if not _has_value(value):
             quality[field_name] = "missing"
         elif field_name in estimated_fields:
             quality[field_name] = "estimated"
         else:
             quality[field_name] = "present"
     return quality
+
+
+def _option_proxy_fields() -> set[str]:
+    return {
+        "dealer_gamma_exposure_proxy",
+        "option_chain_source",
+        "option_chain_provider",
+        "option_chain_fetched_at",
+        "option_chain_freshness_seconds",
+        "option_chain_stale_after_seconds",
+        "option_chain_capabilities",
+    }
+
+
+def _has_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, (dict, list, tuple, set)):
+        return bool(value)
+    return True
 
 
 def _reverse_split_metrics(ticker: Any, lookback_days: int = 180) -> tuple[dict[str, float | bool | None], list[str]]:
@@ -241,14 +279,22 @@ def _reverse_split_metrics(ticker: Any, lookback_days: int = 180) -> tuple[dict[
 def _options_metrics(
     ticker: Any,
     price: float | None,
+    *,
+    fetched_at: str | None = None,
     max_expirations: int = 2,
-) -> tuple[dict[str, float | None], list[str]]:
+) -> tuple[dict[str, Any], list[str]]:
     empty = {
         "call_volume": None,
         "put_volume": None,
         "call_open_interest": None,
         "put_open_interest": None,
         "dealer_gamma_exposure_proxy": None,
+        "option_chain_source": None,
+        "option_chain_provider": None,
+        "option_chain_fetched_at": None,
+        "option_chain_freshness_seconds": None,
+        "option_chain_stale_after_seconds": None,
+        "option_chain_capabilities": {},
     }
     try:
         expirations = list(getattr(ticker, "options", ()) or ())
@@ -292,6 +338,12 @@ def _options_metrics(
         "call_open_interest": call_open_interest,
         "put_open_interest": put_open_interest,
         "dealer_gamma_exposure_proxy": dealer_gamma_exposure_proxy if price is not None else None,
+        "option_chain_source": YAHOO_OPTION_SOURCE,
+        "option_chain_provider": "yahoo_finance",
+        "option_chain_fetched_at": fetched_at,
+        "option_chain_freshness_seconds": 0.0 if fetched_at is not None else None,
+        "option_chain_stale_after_seconds": YAHOO_OPTION_STALE_AFTER_SECONDS,
+        "option_chain_capabilities": dict(YAHOO_OPTION_CAPABILITIES),
     }, warnings
 
 

@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import sqlite3
 import time
 from dataclasses import MISSING, asdict, dataclass, fields
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Any, Callable
 
 from .config import DEFAULT_CACHE_TTL_SECONDS
 from .domain import MarketDataProvider, TickerSnapshot
+from .options import normalize_option_chain_records
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +49,8 @@ class CachedMarketDataProvider:
         self.clock = clock
         self._schema_lock = Lock()
         self._schema_ready = False
+        self._provider_status_lock = Lock()
+        self._last_provider_fetch: dict[str, Any] = {"status": "not_requested"}
 
     def fetch(self, symbol: str) -> TickerSnapshot:
         self._ensure_schema()
@@ -56,7 +61,26 @@ class CachedMarketDataProvider:
             self._touch_scan(symbol, now)
             return cached
 
-        snapshot = self.provider.fetch(symbol)
+        provider_started_at = self.clock()
+        monotonic_started_at = time.perf_counter()
+        try:
+            snapshot = self.provider.fetch(symbol)
+        except Exception as exc:
+            self._record_provider_fetch(
+                symbol=symbol,
+                started_at=provider_started_at,
+                latency_ms=(time.perf_counter() - monotonic_started_at) * 1000,
+                status="error",
+                error=str(exc),
+            )
+            raise
+        self._record_provider_fetch(
+            symbol=symbol,
+            started_at=provider_started_at,
+            latency_ms=(time.perf_counter() - monotonic_started_at) * 1000,
+            status="ok",
+            error=None,
+        )
         self._write(symbol, snapshot, now)
         return snapshot
 
@@ -205,6 +229,71 @@ class CachedMarketDataProvider:
                 (self.provider_name, symbol),
             )
             return cursor.rowcount > 0
+
+    def status(self) -> dict[str, Any]:
+        try:
+            self._ensure_schema()
+            now = self.clock()
+            with self._connect() as connection:
+                cache_row = connection.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS total_rows,
+                        SUM(CASE WHEN ? - fetched_at <= ? THEN 1 ELSE 0 END) AS fresh_rows,
+                        SUM(CASE WHEN ? - fetched_at > ? THEN 1 ELSE 0 END) AS stale_rows,
+                        MAX(fetched_at) AS latest_fetched_at,
+                        MAX(scanned_at) AS latest_scanned_at
+                    FROM market_data_cache
+                    WHERE provider = ?
+                    """,
+                    (now, self.ttl_seconds, now, self.ttl_seconds, self.provider_name),
+                ).fetchone()
+                history_row = connection.execute(
+                    """
+                    SELECT COUNT(*) AS history_rows, MAX(fetched_at) AS latest_history_fetched_at
+                    FROM market_data_history
+                    WHERE provider = ?
+                    """,
+                    (self.provider_name,),
+                ).fetchone()
+        except Exception as exc:
+            return {
+                "status": "degraded",
+                "provider": self._provider_status(),
+                "database": {
+                    "backend": "sqlite",
+                    "accessible": False,
+                    "error": str(exc),
+                },
+                "cache": {
+                    "ttl_seconds": self.ttl_seconds,
+                    "fresh_rows": 0,
+                    "stale_rows": 0,
+                    "total_rows": 0,
+                },
+            }
+
+        latest_fetched_at = _optional_float(cache_row["latest_fetched_at"]) if cache_row is not None else None
+        latest_scanned_at = _optional_float(cache_row["latest_scanned_at"]) if cache_row is not None else None
+        return {
+            "status": "ok",
+            "provider": self._provider_status(),
+            "database": {
+                "backend": "sqlite",
+                "accessible": True,
+                "latest_rows": _row_int(cache_row, "total_rows"),
+                "history_rows": _row_int(history_row, "history_rows"),
+            },
+            "cache": {
+                "ttl_seconds": self.ttl_seconds,
+                "total_rows": _row_int(cache_row, "total_rows"),
+                "fresh_rows": _row_int(cache_row, "fresh_rows"),
+                "stale_rows": _row_int(cache_row, "stale_rows"),
+                "latest_fetched_at": _timestamp_to_iso(latest_fetched_at),
+                "latest_scanned_at": _timestamp_to_iso(latest_scanned_at),
+                "seconds_since_latest_fetch": round(now - latest_fetched_at, 3) if latest_fetched_at else None,
+            },
+        }
 
     def _read(self, symbol: str, now: float) -> TickerSnapshot | None:
         with self._connect() as connection:
@@ -368,6 +457,32 @@ class CachedMarketDataProvider:
             (self.provider_name, symbol, fetched_at, scanned_at, payload_json),
         )
 
+    def _record_provider_fetch(
+        self,
+        *,
+        symbol: str,
+        started_at: float,
+        latency_ms: float,
+        status: str,
+        error: str | None,
+    ) -> None:
+        with self._provider_status_lock:
+            self._last_provider_fetch = {
+                "provider": self.provider_name,
+                "symbol": symbol,
+                "status": status,
+                "started_at": _timestamp_to_iso(started_at),
+                "latency_ms": round(latency_ms, 3),
+                "error": error,
+            }
+
+    def _provider_status(self) -> dict[str, Any]:
+        with self._provider_status_lock:
+            return {
+                "name": self.provider_name,
+                "last_fetch": dict(self._last_provider_fetch),
+            }
+
 
 def snapshot_from_json(payload_json: str) -> TickerSnapshot:
     payload = json.loads(payload_json)
@@ -399,5 +514,42 @@ def snapshot_from_json(payload_json: str) -> TickerSnapshot:
         snapshot_payload["field_quality"] = {}
     if not isinstance(snapshot_payload["source_quality"], dict):
         snapshot_payload["source_quality"] = {}
+    if not isinstance(snapshot_payload["option_chain_capabilities"], dict):
+        snapshot_payload["option_chain_capabilities"] = {}
+    else:
+        snapshot_payload["option_chain_capabilities"] = {
+            str(key): bool(value)
+            for key, value in snapshot_payload["option_chain_capabilities"].items()
+        }
+    snapshot_payload["option_chain_records"] = normalize_option_chain_records(
+        snapshot_payload.get("option_chain_records"),
+        fallback_symbol=snapshot_payload["symbol"],
+        provider=snapshot_payload.get("option_chain_provider"),
+        source=snapshot_payload.get("option_chain_source"),
+    )
 
     return TickerSnapshot(**snapshot_payload)
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _row_int(row: sqlite3.Row | None, key: str) -> int:
+    if row is None or row[key] is None:
+        return 0
+    return int(row[key])
+
+
+def _timestamp_to_iso(value: float | None) -> str | None:
+    if value is None:
+        return None
+    return datetime.fromtimestamp(float(value), timezone.utc).isoformat()

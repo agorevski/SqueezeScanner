@@ -29,6 +29,26 @@ DELTA_WINDOW_SECONDS: dict[str, int] = {
     "7d": 7 * 24 * 60 * 60,
 }
 MODEL_LABELS = {str(model["key"]): str(model["label"]) for model in SCORING_MODELS}
+DEFAULT_GAMMA_THRESHOLD_METRICS: tuple[str, ...] = (
+    "net_gamma_exposure_pct_market_cap",
+    "absolute_gamma_exposure_pct_market_cap",
+    "gamma_flip_distance_pct",
+    "call_wall_distance_pct",
+    "put_wall_distance_pct",
+    "gamma_strike_concentration_pct",
+    "gamma_expiration_concentration_pct",
+    "open_interest_change",
+)
+GAMMA_THRESHOLD_METRIC_LABELS: dict[str, str] = {
+    "net_gamma_exposure_pct_market_cap": "Net GEX % market cap",
+    "absolute_gamma_exposure_pct_market_cap": "Absolute GEX % market cap",
+    "gamma_flip_distance_pct": "Gamma flip distance %",
+    "call_wall_distance_pct": "Call-wall distance %",
+    "put_wall_distance_pct": "Put-wall distance %",
+    "gamma_strike_concentration_pct": "Gamma strike concentration %",
+    "gamma_expiration_concentration_pct": "Gamma expiration concentration %",
+    "open_interest_change": "Open-interest change",
+}
 
 
 @dataclass(frozen=True)
@@ -141,6 +161,7 @@ class AnalyticsStore:
             or payload.get("confidence")
         )
         metrics = _coerce_json_object(payload.get("metrics") or payload.get("metrics_json"))
+        metrics = _metrics_with_source_metadata(metrics, payload)
         risk_flags = _coerce_json_value(payload.get("risk_flags") or payload.get("risk_flags_json"), default=[])
         warnings = _coerce_json_value(payload.get("warnings") or payload.get("warnings_json"), default=[])
         symbol = str(payload["symbol"]).upper()
@@ -250,6 +271,8 @@ class AnalyticsStore:
         horizon: str | int | Horizon = "1d",
         bucket_size: float = 10.0,
         scoring_model_version: str | None = None,
+        slice_by_source_quality: bool = False,
+        source_quality_slice: str | None = None,
     ) -> list[dict[str, Any]]:
         self._ensure_schema()
         if bucket_size <= 0:
@@ -261,61 +284,324 @@ class AnalyticsStore:
             params: list[Any] = [model, selected_horizon.seconds]
             version_clause = ""
             if scoring_model_version is not None:
-                version_clause = "AND scoring_model_version = ?"
+                version_clause = "AND o.scoring_model_version = ?"
                 params.append(scoring_model_version)
             rows = connection.execute(
                 f"""
-                SELECT score_at_scan,
-                       forward_return_pct,
-                       max_favorable_excursion_pct,
-                       max_adverse_excursion_pct
-                FROM scan_outcomes
-                WHERE model = ?
-                  AND horizon_seconds = ?
+                SELECT o.score_at_scan,
+                       o.forward_return_pct,
+                       o.max_favorable_excursion_pct,
+                       o.max_adverse_excursion_pct,
+                       o.scoring_model_version,
+                       s.provider,
+                       s.data_quality,
+                       s.metrics_json,
+                       s.risk_flags_json,
+                       s.warnings_json
+                FROM scan_outcomes AS o
+                LEFT JOIN scan_score_history AS s
+                  ON s.id = o.scan_score_history_id
+                WHERE o.model = ?
+                  AND o.horizon_seconds = ?
                   {version_clause}
-                ORDER BY score_at_scan ASC, id ASC
+                ORDER BY o.score_at_scan ASC, o.id ASC
                 """,
                 params,
             ).fetchall()
 
-        buckets: dict[float, list[dict[str, float | None]]] = {}
+        normalized_source_slice = _normalize_source_slice(source_quality_slice)
+        use_source_slices = slice_by_source_quality or normalized_source_slice is not None
+        buckets: dict[tuple[float, str | None], list[dict[str, float | None]]] = {}
         for row in rows:
             score = _as_float(row["score_at_scan"])
             if score is None:
                 continue
             bucket_start = _bucket_start(score, bucket_size)
-            buckets.setdefault(bucket_start, []).append(
-                {
-                    "return": _as_float(row["forward_return_pct"]),
-                    "mfe": _as_float(row["max_favorable_excursion_pct"]),
-                    "mae": _as_float(row["max_adverse_excursion_pct"]),
-                }
-            )
+            source_slices: list[str | None] = [None]
+            if use_source_slices:
+                source_slices = _source_quality_slices(_outcome_source_context(row))
+                if normalized_source_slice is not None:
+                    source_slices = [name for name in source_slices if name == normalized_source_slice]
+                if not source_slices:
+                    continue
+            values = {
+                "return": _as_float(row["forward_return_pct"]),
+                "mfe": _as_float(row["max_favorable_excursion_pct"]),
+                "mae": _as_float(row["max_adverse_excursion_pct"]),
+            }
+            for source_slice in source_slices:
+                buckets.setdefault((bucket_start, source_slice), []).append(values)
 
         report: list[dict[str, Any]] = []
-        for bucket_start in sorted(buckets):
-            values = buckets[bucket_start]
+        for bucket_start, source_slice in sorted(buckets, key=lambda key: (str(key[1] or ""), key[0])):
+            values = buckets[(bucket_start, source_slice)]
             returns = [float(value["return"]) for value in values if value["return"] is not None]
             adverse = [float(value["mae"]) for value in values if value["mae"] is not None]
             favorable = [float(value["mfe"]) for value in values if value["mfe"] is not None]
             bucket_end = min(100.0, bucket_start + bucket_size)
-            report.append(
+            row_payload = {
+                "model": model,
+                "horizon": selected_horizon.label,
+                "horizon_seconds": selected_horizon.seconds,
+                "score_bucket": _bucket_label(bucket_start, bucket_end),
+                "bucket_start": _clean_number(bucket_start),
+                "bucket_end": _clean_number(bucket_end),
+                "count": len(values),
+                "avg_return_pct": _mean(returns),
+                "win_rate": _mean([1.0 if value > 0 else 0.0 for value in returns]),
+                "avg_max_favorable_excursion_pct": _mean(favorable),
+                "avg_max_adverse_excursion_pct": _mean(adverse),
+                "worst_max_adverse_excursion_pct": _round_number(min(adverse)) if adverse else None,
+            }
+            if source_slice is not None:
+                row_payload["source_quality_slice"] = source_slice
+            report.append(row_payload)
+        return report
+
+    def report_model_version_comparison(
+        self,
+        *,
+        model: str,
+        horizon: str | int | Horizon = "1d",
+        base_version: str | None = None,
+        compare_version: str | None = None,
+        bucket_size: float = 10.0,
+        deterioration_threshold_pct: float = 0.0,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        self._ensure_schema()
+        if bucket_size <= 0:
+            raise ValueError("bucket_size must be greater than zero")
+        selected_horizon = _normalize_horizons([horizon])[0]
+        base_version, compare_version = self._resolve_model_versions(
+            model=model,
+            horizon=selected_horizon,
+            base_version=base_version,
+            compare_version=compare_version,
+        )
+        if base_version is None or compare_version is None:
+            return []
+        if base_version == compare_version:
+            raise ValueError("base_version and compare_version must be different")
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT base.symbol,
+                       base.scan_score_history_id AS base_score_history_id,
+                       compare.scan_score_history_id AS compare_score_history_id,
+                       base.scan_created_at,
+                       base.model,
+                       base.horizon_label,
+                       base.horizon_seconds,
+                       base.scoring_model_version AS base_scoring_model_version,
+                       compare.scoring_model_version AS compare_scoring_model_version,
+                       base.score_at_scan AS base_score,
+                       compare.score_at_scan AS compare_score,
+                       base.forward_return_pct AS base_forward_return_pct,
+                       compare.forward_return_pct AS compare_forward_return_pct,
+                       base.max_favorable_excursion_pct AS base_max_favorable_excursion_pct,
+                       compare.max_favorable_excursion_pct AS compare_max_favorable_excursion_pct,
+                       base.max_adverse_excursion_pct AS base_max_adverse_excursion_pct,
+                       compare.max_adverse_excursion_pct AS compare_max_adverse_excursion_pct
+                FROM scan_outcomes AS base
+                JOIN scan_outcomes AS compare
+                  ON compare.symbol = base.symbol
+                 AND compare.scan_created_at = base.scan_created_at
+                 AND compare.model = base.model
+                 AND compare.horizon_seconds = base.horizon_seconds
+                WHERE base.model = ?
+                  AND base.horizon_seconds = ?
+                  AND base.scoring_model_version = ?
+                  AND compare.scoring_model_version = ?
+                ORDER BY ABS(COALESCE(compare.score_at_scan, 0) - COALESCE(base.score_at_scan, 0)) DESC,
+                         base.scan_created_at DESC,
+                         base.symbol ASC
+                """,
+                (model, selected_horizon.seconds, base_version, compare_version),
+            ).fetchall()
+
+        report_rows: list[dict[str, Any]] = []
+        for row in rows:
+            base_score = _as_float(row["base_score"])
+            compare_score = _as_float(row["compare_score"])
+            if base_score is None or compare_score is None:
+                continue
+            base_bucket_start = _bucket_start(base_score, bucket_size)
+            compare_bucket_start = _bucket_start(compare_score, bucket_size)
+            base_bucket_end = min(100.0, base_bucket_start + bucket_size)
+            compare_bucket_end = min(100.0, compare_bucket_start + bucket_size)
+            compare_return = _as_float(row["compare_forward_return_pct"])
+            compare_mfe = _as_float(row["compare_max_favorable_excursion_pct"])
+            compare_mae = _as_float(row["compare_max_adverse_excursion_pct"])
+            report_rows.append(
                 {
-                    "model": model,
-                    "horizon": selected_horizon.label,
-                    "horizon_seconds": selected_horizon.seconds,
-                    "score_bucket": _bucket_label(bucket_start, bucket_end),
-                    "bucket_start": _clean_number(bucket_start),
-                    "bucket_end": _clean_number(bucket_end),
-                    "count": len(values),
-                    "avg_return_pct": _mean(returns),
-                    "win_rate": _mean([1.0 if value > 0 else 0.0 for value in returns]),
-                    "avg_max_favorable_excursion_pct": _mean(favorable),
-                    "avg_max_adverse_excursion_pct": _mean(adverse),
-                    "worst_max_adverse_excursion_pct": _round_number(min(adverse)) if adverse else None,
+                    "symbol": row["symbol"],
+                    "scan_created_at": row["scan_created_at"],
+                    "model": row["model"],
+                    "horizon": row["horizon_label"],
+                    "horizon_seconds": int(row["horizon_seconds"]),
+                    "base_scoring_model_version": row["base_scoring_model_version"],
+                    "compare_scoring_model_version": row["compare_scoring_model_version"],
+                    "base_score_history_id": row["base_score_history_id"],
+                    "compare_score_history_id": row["compare_score_history_id"],
+                    "base_score": _round_number(base_score),
+                    "compare_score": _round_number(compare_score),
+                    "score_delta": _round_number(compare_score - base_score),
+                    "base_score_bucket": _bucket_label(base_bucket_start, base_bucket_end),
+                    "compare_score_bucket": _bucket_label(compare_bucket_start, compare_bucket_end),
+                    "base_forward_return_pct": _round_number(_as_float(row["base_forward_return_pct"])),
+                    "compare_forward_return_pct": _round_number(compare_return),
+                    "forward_return_pct": _round_number(compare_return),
+                    "base_max_favorable_excursion_pct": _round_number(
+                        _as_float(row["base_max_favorable_excursion_pct"])
+                    ),
+                    "compare_max_favorable_excursion_pct": _round_number(compare_mfe),
+                    "max_favorable_excursion_pct": _round_number(compare_mfe),
+                    "base_max_adverse_excursion_pct": _round_number(
+                        _as_float(row["base_max_adverse_excursion_pct"])
+                    ),
+                    "compare_max_adverse_excursion_pct": _round_number(compare_mae),
+                    "max_adverse_excursion_pct": _round_number(compare_mae),
+                    "base_deteriorated": _outcome_deteriorated(
+                        row["base_forward_return_pct"],
+                        row["base_max_adverse_excursion_pct"],
+                        deterioration_threshold_pct,
+                    ),
+                    "compare_deteriorated": _outcome_deteriorated(
+                        row["compare_forward_return_pct"],
+                        row["compare_max_adverse_excursion_pct"],
+                        deterioration_threshold_pct,
+                    ),
                 }
             )
-        return report
+        return _ranked(report_rows, limit=limit, offset=offset)
+
+    def report_gamma_threshold_review(
+        self,
+        *,
+        model: str = "gamma_candidate",
+        horizon: str | int | Horizon = "1d",
+        metrics: Sequence[str] | str | None = None,
+        bucket_size: float = 5.0,
+        scoring_model_version: str | None = None,
+        include_missing: bool = True,
+        limit: int = 500,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        self._ensure_schema()
+        if bucket_size <= 0:
+            raise ValueError("bucket_size must be greater than zero")
+        selected_horizon = _normalize_horizons([horizon])[0]
+        selected_metrics = _normalize_gamma_metrics(metrics)
+
+        with self._connect() as connection:
+            params: list[Any] = [model, selected_horizon.seconds]
+            version_clause = ""
+            if scoring_model_version is not None:
+                version_clause = "AND o.scoring_model_version = ?"
+                params.append(scoring_model_version)
+            rows = connection.execute(
+                f"""
+                SELECT o.model,
+                       o.horizon_label,
+                       o.horizon_seconds,
+                       o.scoring_model_version,
+                       o.forward_return_pct,
+                       o.max_favorable_excursion_pct,
+                       o.max_adverse_excursion_pct,
+                       s.metrics_json
+                FROM scan_outcomes AS o
+                LEFT JOIN scan_score_history AS s
+                  ON s.id = o.scan_score_history_id
+                WHERE o.model = ?
+                  AND o.horizon_seconds = ?
+                  {version_clause}
+                ORDER BY o.scan_created_at ASC, o.id ASC
+                """,
+                params,
+            ).fetchall()
+
+        grouped: dict[tuple[str, str], list[dict[str, float | None]]] = {}
+        bucket_meta: dict[tuple[str, str], dict[str, Any]] = {}
+        metric_order = {metric: index for index, metric in enumerate(selected_metrics)}
+        for row in rows:
+            row_metrics = _loads_json(row["metrics_json"], default={})
+            if not isinstance(row_metrics, Mapping):
+                row_metrics = {}
+            for metric in selected_metrics:
+                metric_value = _gamma_metric_value(metric, row_metrics)
+                if metric_value is None:
+                    if not include_missing:
+                        continue
+                    bucket_key = "missing"
+                    meta = {
+                        "metric": metric,
+                        "metric_label": GAMMA_THRESHOLD_METRIC_LABELS.get(metric, metric),
+                        "metric_bucket": "missing",
+                        "bucket_start": None,
+                        "bucket_end": None,
+                        "is_missing_bucket": True,
+                    }
+                else:
+                    bucket_start = _value_bucket_start(metric_value, bucket_size)
+                    bucket_end = bucket_start + bucket_size
+                    bucket_key = _bucket_label(bucket_start, bucket_end)
+                    meta = {
+                        "metric": metric,
+                        "metric_label": GAMMA_THRESHOLD_METRIC_LABELS.get(metric, metric),
+                        "metric_bucket": bucket_key,
+                        "bucket_start": _clean_number(bucket_start),
+                        "bucket_end": _clean_number(bucket_end),
+                        "is_missing_bucket": False,
+                    }
+                key = (metric, bucket_key)
+                bucket_meta.setdefault(key, meta)
+                grouped.setdefault(key, []).append(
+                    {
+                        "metric_value": metric_value,
+                        "return": _as_float(row["forward_return_pct"]),
+                        "mfe": _as_float(row["max_favorable_excursion_pct"]),
+                        "mae": _as_float(row["max_adverse_excursion_pct"]),
+                    }
+                )
+
+        report_rows: list[dict[str, Any]] = []
+        sorted_keys = sorted(
+            grouped,
+            key=lambda key: (
+                metric_order.get(key[0], len(metric_order)),
+                bool(bucket_meta[key]["is_missing_bucket"]),
+                float(bucket_meta[key]["bucket_start"] or 0),
+                key[1],
+            ),
+        )
+        for key in sorted_keys:
+            values = grouped[key]
+            metric_values = [
+                float(value["metric_value"]) for value in values if value["metric_value"] is not None
+            ]
+            returns = [float(value["return"]) for value in values if value["return"] is not None]
+            adverse = [float(value["mae"]) for value in values if value["mae"] is not None]
+            favorable = [float(value["mfe"]) for value in values if value["mfe"] is not None]
+            row_payload = {
+                "model": model,
+                "horizon": selected_horizon.label,
+                "horizon_seconds": selected_horizon.seconds,
+                **bucket_meta[key],
+                "count": len(values),
+                "missing_count": sum(1 for value in values if value["metric_value"] is None),
+                "avg_metric_value": _mean(metric_values),
+                "avg_return_pct": _mean(returns),
+                "win_rate": _mean([1.0 if value > 0 else 0.0 for value in returns]),
+                "avg_max_favorable_excursion_pct": _mean(favorable),
+                "avg_max_adverse_excursion_pct": _mean(adverse),
+                "worst_max_adverse_excursion_pct": _round_number(min(adverse)) if adverse else None,
+            }
+            row_payload.pop("is_missing_bucket", None)
+            report_rows.append(row_payload)
+        return _ranked(report_rows, limit=limit, offset=offset)
 
     def explain_score_deltas(
         self,
@@ -570,6 +856,41 @@ class AnalyticsStore:
 
     def rows_to_csv(self, rows: Sequence[Mapping[str, Any]], columns: Sequence[str] | None = None) -> str:
         return rows_to_csv(rows, columns=columns)
+
+    def _resolve_model_versions(
+        self,
+        *,
+        model: str,
+        horizon: Horizon,
+        base_version: str | None,
+        compare_version: str | None,
+    ) -> tuple[str | None, str | None]:
+        if base_version is not None and compare_version is not None:
+            return base_version, compare_version
+        with self._connect() as connection:
+            version_rows = connection.execute(
+                """
+                SELECT scoring_model_version,
+                       MIN(scan_created_at) AS first_scan_at,
+                       MAX(scan_created_at) AS last_scan_at
+                FROM scan_outcomes
+                WHERE model = ?
+                  AND horizon_seconds = ?
+                GROUP BY scoring_model_version
+                ORDER BY first_scan_at ASC, last_scan_at ASC, scoring_model_version ASC
+                """,
+                (model, horizon.seconds),
+            ).fetchall()
+        versions = [str(row["scoring_model_version"]) for row in version_rows]
+        if len(versions) < 2:
+            return base_version, compare_version
+        if compare_version is None:
+            candidates = [version for version in versions if version != base_version]
+            compare_version = candidates[-1] if candidates else None
+        if base_version is None:
+            candidates = [version for version in versions if version != compare_version]
+            base_version = candidates[-1] if candidates else None
+        return base_version, compare_version
 
     def _compute_outcomes_for_score_row(
         self,
@@ -1309,6 +1630,247 @@ def _outcome_exists(
         ),
     ).fetchone()
     return row is not None
+
+
+def _metrics_with_source_metadata(metrics: Mapping[str, Any], payload: Mapping[str, Any]) -> dict[str, Any]:
+    merged = dict(metrics)
+    for metrics_key, payload_key in (
+        ("_field_sources", "field_sources"),
+        ("_field_quality", "field_quality"),
+        ("_source_quality", "source_quality"),
+    ):
+        value = _coerce_json_object(payload.get(payload_key) or payload.get(f"{payload_key}_json"))
+        if value and metrics_key not in merged:
+            merged[metrics_key] = value
+    return merged
+
+
+def _outcome_source_context(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
+    payload = dict(row)
+    metrics = _loads_json(payload.get("metrics_json"), default={})
+    risk_flags = _loads_json(payload.get("risk_flags_json"), default=[])
+    warnings = _loads_json(payload.get("warnings_json"), default=[])
+    return {
+        "provider": payload.get("provider"),
+        "data_quality": _as_float(payload.get("data_quality")),
+        "metrics": metrics if isinstance(metrics, Mapping) else {},
+        "risk_flags": risk_flags,
+        "warnings": warnings,
+    }
+
+
+def _normalize_source_slice(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower().replace("-", "_").replace(" ", "_")
+    return normalized or None
+
+
+def _source_quality_slices(context: Mapping[str, Any]) -> list[str]:
+    metrics = context.get("metrics") if isinstance(context.get("metrics"), Mapping) else {}
+    provider = str(context.get("provider") or "").lower()
+    field_sources = _metadata_mapping(metrics, "_field_sources")
+    field_quality = _metadata_mapping(metrics, "_field_quality")
+    capabilities = metrics.get("option_chain_capabilities")
+    capabilities = capabilities if isinstance(capabilities, Mapping) else {}
+    option_provider = str(metrics.get("option_chain_provider") or "").lower()
+    option_source = str(metrics.get("option_chain_source") or "").lower()
+    risk_keys = _risk_flag_keys(context.get("risk_flags"))
+    warnings = [str(warning).lower() for warning in context.get("warnings") or []]
+    slices: set[str] = set()
+
+    true_greeks = bool(capabilities.get("true_gamma_exposure")) or (
+        bool(capabilities.get("gamma")) and option_provider and "yahoo" not in option_provider
+    )
+    if true_greeks:
+        slices.add("true_options_greeks")
+
+    borrow_sources = {
+        str(field_sources.get(field_name) or "").lower()
+        for field_name in (
+            "borrow_fee_pct",
+            "borrow_available_shares",
+            "borrow_utilization_pct",
+            "borrow_rebate_rate_pct",
+        )
+    }
+    borrow_values_present = any(
+        _as_float(metrics.get(field_name)) is not None
+        for field_name in (
+            "borrow_fee_pct",
+            "borrow_available_shares",
+            "borrow_utilization_pct",
+            "borrow_rebate_rate_pct",
+        )
+    )
+    if borrow_values_present or any(source and "yahoo" not in source for source in borrow_sources):
+        slices.add("premium_borrow")
+
+    if (
+        any(str(status).lower() == "stale" for status in field_quality.values())
+        or "stale_data" in risk_keys
+        or any("stale" in warning for warning in warnings)
+        or _option_chain_is_stale(metrics)
+    ):
+        slices.add("stale_data")
+
+    data_quality = _as_float(context.get("data_quality"))
+    missing_statuses = {"missing", "provider-error"}
+    if (
+        any(str(status).lower() in missing_statuses for status in field_quality.values())
+        or any("missing" in key for key in risk_keys)
+        or "low_data_quality" in risk_keys
+        or any("missing" in warning for warning in warnings)
+        or (data_quality is not None and data_quality < 100)
+    ):
+        slices.add("missing_data")
+
+    has_premium_or_true = bool(slices & {"premium_borrow", "true_options_greeks"})
+    yahoo_markers = (provider, option_provider, option_source, *(_metadata_mapping(metrics, "_source_quality").keys()))
+    if not has_premium_or_true and any("yahoo" in str(marker).lower() for marker in yahoo_markers):
+        slices.add("yahoo_only")
+
+    return sorted(slices) if slices else ["unknown_source"]
+
+
+def _metadata_mapping(metrics: Mapping[str, Any], key: str) -> dict[str, Any]:
+    value = metrics.get(key)
+    if value is None and key.startswith("_"):
+        value = metrics.get(key[1:])
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _risk_flag_keys(value: Any) -> set[str]:
+    if isinstance(value, Mapping):
+        return {str(key).lower() for key, enabled in value.items() if enabled}
+    if isinstance(value, list):
+        keys: set[str] = set()
+        for item in value:
+            if isinstance(item, Mapping):
+                key = item.get("key") or item.get("name")
+                if key:
+                    keys.add(str(key).lower())
+            else:
+                keys.add(str(item).lower())
+        return keys
+    return set()
+
+
+def _option_chain_is_stale(metrics: Mapping[str, Any]) -> bool:
+    freshness = _as_float(metrics.get("option_chain_freshness_seconds"))
+    stale_after = _as_float(metrics.get("option_chain_stale_after_seconds"))
+    return freshness is not None and stale_after is not None and freshness > stale_after
+
+
+def _normalize_gamma_metrics(metrics: Sequence[str] | str | None) -> list[str]:
+    if metrics is None:
+        return list(DEFAULT_GAMMA_THRESHOLD_METRICS)
+    if isinstance(metrics, str):
+        raw_items = metrics.replace(";", ",").split(",")
+    else:
+        raw_items = [str(metric) for metric in metrics]
+    normalized = [item.strip() for item in raw_items if item.strip()]
+    return normalized or list(DEFAULT_GAMMA_THRESHOLD_METRICS)
+
+
+def _gamma_metric_value(metric: str, metrics: Mapping[str, Any]) -> float | None:
+    if metric == "net_gamma_exposure_pct_market_cap":
+        value = _first_metric_value(
+            metrics,
+            (
+                "net_gamma_exposure_pct_market_cap",
+                "net_gex_pct_market_cap",
+                "net_gex_percent_market_cap",
+            ),
+        )
+        return value if value is not None else _pct_of_market_cap(
+            metrics.get("net_gamma_exposure"),
+            metrics.get("market_cap"),
+        )
+    if metric == "absolute_gamma_exposure_pct_market_cap":
+        value = _first_metric_value(
+            metrics,
+            (
+                "absolute_gamma_exposure_pct_market_cap",
+                "absolute_gex_pct_market_cap",
+                "absolute_gex_percent_market_cap",
+                "gamma_exposure_pct_market_cap",
+            ),
+        )
+        return value if value is not None else _pct_of_market_cap(
+            metrics.get("absolute_gamma_exposure"),
+            metrics.get("market_cap"),
+            absolute=True,
+        )
+    if metric == "call_wall_distance_pct":
+        value = _first_metric_value(
+            metrics,
+            ("call_wall_distance_pct", "call_wall_distance_percent"),
+        )
+        return value if value is not None else _wall_distance_pct(metrics, "call_wall_strike")
+    if metric == "put_wall_distance_pct":
+        value = _first_metric_value(
+            metrics,
+            ("put_wall_distance_pct", "put_wall_distance_percent"),
+        )
+        return value if value is not None else _wall_distance_pct(metrics, "put_wall_strike")
+    if metric == "open_interest_change":
+        return _first_metric_value(
+            metrics,
+            (
+                "open_interest_change",
+                "open_interest_change_pct",
+                "oi_change",
+                "oi_change_pct",
+                "net_open_interest_change",
+                "option_open_interest_change",
+                "option_open_interest_change_pct",
+            ),
+        )
+    return _first_metric_value(metrics, (metric,))
+
+
+def _first_metric_value(metrics: Mapping[str, Any], keys: Sequence[str]) -> float | None:
+    for key in keys:
+        value = _as_float(metrics.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _pct_of_market_cap(value: Any, market_cap: Any, *, absolute: bool = False) -> float | None:
+    numeric_value = _as_float(value)
+    numeric_market_cap = _positive_float(market_cap)
+    if numeric_value is None or numeric_market_cap is None:
+        return None
+    if absolute:
+        numeric_value = abs(numeric_value)
+    return numeric_value / numeric_market_cap * 100.0
+
+
+def _wall_distance_pct(metrics: Mapping[str, Any], strike_key: str) -> float | None:
+    strike = _positive_float(metrics.get(strike_key))
+    price = _positive_float(metrics.get("price"))
+    if strike is None or price is None:
+        return None
+    return _pct_change(price, strike)
+
+
+def _value_bucket_start(value: float, bucket_size: float) -> float:
+    return math.floor(float(value) / bucket_size) * bucket_size
+
+
+def _outcome_deteriorated(
+    forward_return_pct: Any,
+    max_adverse_excursion_pct: Any,
+    threshold_pct: float,
+) -> bool:
+    threshold = abs(float(threshold_pct))
+    forward_return = _as_float(forward_return_pct)
+    adverse = _as_float(max_adverse_excursion_pct)
+    return (forward_return is not None and forward_return < -threshold) or (
+        adverse is not None and adverse < -threshold
+    )
 
 
 def _bucket_start(score: float, bucket_size: float) -> float:

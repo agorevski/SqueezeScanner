@@ -25,44 +25,67 @@ class ScreenStore:
         self._schema_lock = Lock()
         self._schema_ready = False
 
-    def list_screens(self) -> list[dict[str, Any]]:
+    def list_screens(self, owner_id: str | None = None) -> list[dict[str, Any]]:
         self._ensure_schema()
+        normalized_owner_id = _normalize_owner_id(owner_id)
+        where = "WHERE owner_id = ?" if normalized_owner_id is not None else ""
+        params: tuple[Any, ...] = (normalized_owner_id,) if normalized_owner_id is not None else ()
         with self._connect() as connection:
             rows = connection.execute(
-                """
-                SELECT id, name, filters_json, created_at, updated_at
+                f"""
+                SELECT id, owner_id, name, filters_json, created_at, updated_at
                 FROM saved_screens
+                {where}
                 ORDER BY updated_at DESC, name COLLATE NOCASE ASC
-                """
+                """,
+                params,
             ).fetchall()
         return [_screen_from_row(row) for row in rows]
 
-    def get_screen(self, screen_id: int) -> dict[str, Any] | None:
+    def get_screen(self, screen_id: int, owner_id: str | None = None) -> dict[str, Any] | None:
         self._ensure_schema()
+        normalized_owner_id = _normalize_owner_id(owner_id)
+        owner_clause = "AND owner_id = ?" if normalized_owner_id is not None else ""
+        params: tuple[Any, ...] = (
+            (screen_id, normalized_owner_id) if normalized_owner_id is not None else (screen_id,)
+        )
         with self._connect() as connection:
             row = connection.execute(
-                """
-                SELECT id, name, filters_json, created_at, updated_at
+                f"""
+                SELECT id, owner_id, name, filters_json, created_at, updated_at
                 FROM saved_screens
                 WHERE id = ?
+                {owner_clause}
                 """,
-                (screen_id,),
+                params,
             ).fetchone()
         return _screen_from_row(row) if row is not None else None
 
-    def create_screen(self, name: str, filters: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    def create_screen(
+        self,
+        name: str,
+        filters: Mapping[str, Any] | None = None,
+        owner_id: str | None = None,
+    ) -> dict[str, Any]:
         self._ensure_schema()
         screen_name = _normalize_name(name, "Saved screen name")
         filters_payload = _normalize_filters(filters)
+        normalized_owner_id = _normalize_owner_id(owner_id)
         now = _utc_now()
 
         with self._connect() as connection:
             cursor = connection.execute(
                 """
-                INSERT INTO saved_screens (name, filters_json, created_at, updated_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO saved_screens (owner_id, name, filters_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (_normalize_name(screen_name, "Saved screen name"), _json_dumps(filters_payload), now, now),
+                (
+                    normalized_owner_id,
+                    _normalize_name(screen_name, "Saved screen name"),
+                    _json_dumps(filters_payload),
+                    now,
+                    now,
+                ),
             )
             screen_id = int(cursor.lastrowid)
 
@@ -77,6 +100,7 @@ class ScreenStore:
         *,
         name: str | None = None,
         filters: Mapping[str, Any] | object = _UNSET,
+        owner_id: str | None | object = _UNSET,
     ) -> dict[str, Any] | None:
         self._ensure_schema()
         updates: list[str] = []
@@ -88,6 +112,9 @@ class ScreenStore:
         if filters is not _UNSET:
             updates.append("filters_json = ?")
             params.append(_json_dumps(_normalize_filters(filters)))
+        if owner_id is not _UNSET:
+            updates.append("owner_id = ?")
+            params.append(_normalize_owner_id(owner_id))
 
         if not updates:
             return self.get_screen(screen_id)
@@ -107,35 +134,54 @@ class ScreenStore:
                 return None
         return self.get_screen(screen_id)
 
-    def delete_screen(self, screen_id: int) -> bool:
+    def delete_screen(self, screen_id: int, owner_id: str | None = None) -> bool:
         self._ensure_schema()
+        normalized_owner_id = _normalize_owner_id(owner_id)
+        owner_clause = "AND owner_id = ?" if normalized_owner_id is not None else ""
+        params: tuple[Any, ...] = (
+            (screen_id, normalized_owner_id) if normalized_owner_id is not None else (screen_id,)
+        )
         with self._connect() as connection:
-            cursor = connection.execute("DELETE FROM saved_screens WHERE id = ?", (screen_id,))
+            cursor = connection.execute(
+                f"DELETE FROM saved_screens WHERE id = ? {owner_clause}",
+                params,
+            )
             return cursor.rowcount > 0
 
-    def list_watchlists(self) -> list[dict[str, Any]]:
+    def list_watchlists(self, owner_id: str | None = None) -> list[dict[str, Any]]:
         self._ensure_schema()
+        normalized_owner_id = _normalize_owner_id(owner_id)
+        where = "WHERE owner_id = ?" if normalized_owner_id is not None else ""
+        params: tuple[Any, ...] = (normalized_owner_id,) if normalized_owner_id is not None else ()
         with self._connect() as connection:
             rows = connection.execute(
-                """
-                SELECT id, name, created_at, updated_at
+                f"""
+                SELECT id, owner_id, name, created_at, updated_at
                 FROM watchlists
+                {where}
                 ORDER BY updated_at DESC, name COLLATE NOCASE ASC
-                """
+                """,
+                params,
             ).fetchall()
             symbols = _watchlist_symbols_by_id(connection)
         return [_watchlist_from_row(row, symbols.get(int(row["id"]), [])) for row in rows]
 
-    def get_watchlist(self, watchlist_id: int) -> dict[str, Any] | None:
+    def get_watchlist(self, watchlist_id: int, owner_id: str | None = None) -> dict[str, Any] | None:
         self._ensure_schema()
+        normalized_owner_id = _normalize_owner_id(owner_id)
+        owner_clause = "AND owner_id = ?" if normalized_owner_id is not None else ""
+        params: tuple[Any, ...] = (
+            (watchlist_id, normalized_owner_id) if normalized_owner_id is not None else (watchlist_id,)
+        )
         with self._connect() as connection:
             row = connection.execute(
-                """
-                SELECT id, name, created_at, updated_at
+                f"""
+                SELECT id, owner_id, name, created_at, updated_at
                 FROM watchlists
                 WHERE id = ?
+                {owner_clause}
                 """,
-                (watchlist_id,),
+                params,
             ).fetchone()
             if row is None:
                 return None
@@ -146,19 +192,21 @@ class ScreenStore:
         self,
         name: str,
         symbols: str | Sequence[str] | None = None,
+        owner_id: str | None = None,
     ) -> dict[str, Any]:
         self._ensure_schema()
         watchlist_name = _normalize_name(name, "Watchlist name")
         normalized_symbols = _normalize_watchlist_symbols(symbols) if symbols is not None else []
+        normalized_owner_id = _normalize_owner_id(owner_id)
         now = _utc_now()
 
         with self._connect() as connection:
             cursor = connection.execute(
                 """
-                INSERT INTO watchlists (name, created_at, updated_at)
-                VALUES (?, ?, ?)
+                INSERT INTO watchlists (owner_id, name, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
                 """,
-                (watchlist_name, now, now),
+                (normalized_owner_id, watchlist_name, now, now),
             )
             watchlist_id = int(cursor.lastrowid)
             _insert_watchlist_symbols(connection, watchlist_id, normalized_symbols, now)
@@ -168,41 +216,68 @@ class ScreenStore:
             raise ScreenStoreError("Watchlist could not be created.")
         return created
 
-    def update_watchlist(self, watchlist_id: int, *, name: str | None = None) -> dict[str, Any] | None:
+    def update_watchlist(
+        self,
+        watchlist_id: int,
+        *,
+        name: str | None = None,
+        owner_id: str | None | object = _UNSET,
+    ) -> dict[str, Any] | None:
         self._ensure_schema()
-        if name is None:
+        updates: list[str] = []
+        params: list[Any] = []
+        if name is not None:
+            updates.append("name = ?")
+            params.append(_normalize_name(name, "Watchlist name"))
+        if owner_id is not _UNSET:
+            updates.append("owner_id = ?")
+            params.append(_normalize_owner_id(owner_id))
+        if not updates:
             return self.get_watchlist(watchlist_id)
 
+        updates.append("updated_at = ?")
+        params.extend([_utc_now(), watchlist_id])
         with self._connect() as connection:
             cursor = connection.execute(
-                """
+                f"""
                 UPDATE watchlists
-                SET name = ?, updated_at = ?
+                SET {', '.join(updates)}
                 WHERE id = ?
                 """,
-                (_normalize_name(name, "Watchlist name"), _utc_now(), watchlist_id),
+                params,
             )
             if cursor.rowcount == 0:
                 return None
         return self.get_watchlist(watchlist_id)
 
-    def delete_watchlist(self, watchlist_id: int) -> bool:
+    def delete_watchlist(self, watchlist_id: int, owner_id: str | None = None) -> bool:
         self._ensure_schema()
+        normalized_owner_id = _normalize_owner_id(owner_id)
+        owner_clause = "AND owner_id = ?" if normalized_owner_id is not None else ""
+        params: tuple[Any, ...] = (
+            (watchlist_id, normalized_owner_id) if normalized_owner_id is not None else (watchlist_id,)
+        )
         with self._connect() as connection:
-            cursor = connection.execute("DELETE FROM watchlists WHERE id = ?", (watchlist_id,))
+            cursor = connection.execute(f"DELETE FROM watchlists WHERE id = ? {owner_clause}", params)
             return cursor.rowcount > 0
 
-    def list_watchlist_symbols(self, watchlist_id: int) -> list[str] | None:
-        watchlist = self.get_watchlist(watchlist_id)
+    def list_watchlist_symbols(self, watchlist_id: int, owner_id: str | None = None) -> list[str] | None:
+        watchlist = self.get_watchlist(watchlist_id, owner_id=owner_id)
         if watchlist is None:
             return None
         return list(watchlist["symbols"])
 
-    def add_symbols(self, watchlist_id: int, symbols: str | Sequence[str]) -> dict[str, Any] | None:
+    def add_symbols(
+        self,
+        watchlist_id: int,
+        symbols: str | Sequence[str],
+        owner_id: str | None = None,
+    ) -> dict[str, Any] | None:
         self._ensure_schema()
         normalized_symbols = _normalize_watchlist_symbols(symbols)
+        normalized_owner_id = _normalize_owner_id(owner_id)
         with self._connect() as connection:
-            if not _watchlist_exists(connection, watchlist_id):
+            if not _watchlist_exists(connection, watchlist_id, owner_id=normalized_owner_id):
                 return None
             now = _utc_now()
             _insert_watchlist_symbols(connection, watchlist_id, normalized_symbols, now)
@@ -210,13 +285,14 @@ class ScreenStore:
                 "UPDATE watchlists SET updated_at = ? WHERE id = ?",
                 (now, watchlist_id),
             )
-        return self.get_watchlist(watchlist_id)
+        return self.get_watchlist(watchlist_id, owner_id=normalized_owner_id)
 
-    def remove_symbol(self, watchlist_id: int, symbol: str) -> bool | None:
+    def remove_symbol(self, watchlist_id: int, symbol: str, owner_id: str | None = None) -> bool | None:
         self._ensure_schema()
         normalized_symbol = _normalize_watchlist_symbols(symbol, max_symbols=1)[0]
+        normalized_owner_id = _normalize_owner_id(owner_id)
         with self._connect() as connection:
-            if not _watchlist_exists(connection, watchlist_id):
+            if not _watchlist_exists(connection, watchlist_id, owner_id=normalized_owner_id):
                 return None
             cursor = connection.execute(
                 """
@@ -253,6 +329,7 @@ class ScreenStore:
                     )
                     """
                 )
+                _ensure_columns(connection, "saved_screens", {"owner_id": "TEXT"})
                 connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS watchlists (
@@ -263,6 +340,7 @@ class ScreenStore:
                     )
                     """
                 )
+                _ensure_columns(connection, "watchlists", {"owner_id": "TEXT"})
                 connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS watchlist_symbols (
@@ -280,6 +358,18 @@ class ScreenStore:
                     ON watchlist_symbols (symbol)
                     """
                 )
+                connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_saved_screens_owner_updated
+                    ON saved_screens (owner_id, updated_at)
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_watchlists_owner_updated
+                    ON watchlists (owner_id, updated_at)
+                    """
+                )
             self._schema_ready = True
 
     def _connect(self) -> sqlite3.Connection:
@@ -294,11 +384,12 @@ def scan_watchlist(
     scanner: "ScannerService",
     watchlist_id: int,
     *,
+    owner_id: str | None = None,
     ranking_mode: str | None = None,
     selected_model: str | None = None,
     sort_direction: str | None = None,
 ) -> dict[str, Any] | None:
-    symbols = store.list_watchlist_symbols(watchlist_id)
+    symbols = store.list_watchlist_symbols(watchlist_id, owner_id=owner_id)
     if symbols is None:
         return None
     if not symbols:
@@ -327,6 +418,7 @@ def _screen_from_row(row: sqlite3.Row) -> dict[str, Any]:
     filters = json.loads(row["filters_json"])
     return {
         "id": int(row["id"]),
+        "owner_id": row["owner_id"],
         "name": row["name"],
         "filters": filters,
         "filters_json": filters,
@@ -338,6 +430,7 @@ def _screen_from_row(row: sqlite3.Row) -> dict[str, Any]:
 def _watchlist_from_row(row: sqlite3.Row, symbols: list[str]) -> dict[str, Any]:
     return {
         "id": int(row["id"]),
+        "owner_id": row["owner_id"],
         "name": row["name"],
         "symbols": symbols,
         "created_at": row["created_at"],
@@ -372,8 +465,10 @@ def _watchlist_symbols(connection: sqlite3.Connection, watchlist_id: int) -> lis
     return [row["symbol"] for row in rows]
 
 
-def _watchlist_exists(connection: sqlite3.Connection, watchlist_id: int) -> bool:
-    row = connection.execute("SELECT 1 FROM watchlists WHERE id = ?", (watchlist_id,)).fetchone()
+def _watchlist_exists(connection: sqlite3.Connection, watchlist_id: int, owner_id: str | None = None) -> bool:
+    owner_clause = "AND owner_id = ?" if owner_id is not None else ""
+    params: tuple[Any, ...] = (watchlist_id, owner_id) if owner_id is not None else (watchlist_id,)
+    row = connection.execute(f"SELECT 1 FROM watchlists WHERE id = ? {owner_clause}", params).fetchone()
     return row is not None
 
 
@@ -410,6 +505,13 @@ def _normalize_name(name: str, label: str) -> str:
     return normalized
 
 
+def _normalize_owner_id(owner_id: Any) -> str | None:
+    if owner_id is None:
+        return None
+    normalized = str(owner_id).strip()
+    return normalized or None
+
+
 def _normalize_watchlist_symbols(
     symbols: str | Sequence[str],
     max_symbols: int = 500,
@@ -424,6 +526,13 @@ def _normalize_watchlist_symbols(
 
 def _json_dumps(payload: Mapping[str, Any]) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _ensure_columns(connection: sqlite3.Connection, table: str, columns: Mapping[str, str]) -> None:
+    existing = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+    for column, ddl in columns.items():
+        if column not in existing:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
 def _utc_now() -> str:

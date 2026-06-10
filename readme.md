@@ -46,6 +46,19 @@ Edit `.env` for your machine. The checked-in `.env.example` lists all supported 
 | `SQUEEZE_SCANNER_RELOAD` | Set to `true` to enable Uvicorn reload through the console script. |
 | `SQUEEZE_SCANNER_CACHE_DB` | Repository-relative or absolute path to the SQLite raw market data cache. |
 | `SQUEEZE_SCANNER_CACHE_TTL_SECONDS` | Raw market data freshness window before a ticker is refreshed. |
+| `SQUEEZE_SCANNER_SCHEDULER_ENABLED` | Enables the in-process scheduler in local mode. Set `false` only when an external worker polls schedules. |
+| `SQUEEZE_SCANNER_SCHEDULER_POLL_SECONDS` | Poll interval for due scheduled scans. |
+| `SQUEEZE_SCANNER_DEFAULT_OWNER_ID` | Optional owner tag for newly-created screens, watchlists, schedules, and alerts. Blank preserves single-user local behavior. |
+| `SQUEEZE_SCANNER_QUOTE_PROVIDER` | Quote/market-data provider. `yahoo` is the only built-in implementation and remains the default. |
+| `SQUEEZE_SCANNER_BORROW_PROVIDER` | Optional premium borrow/securities-lending provider name, or `disabled` for Yahoo-only behavior. |
+| `SQUEEZE_SCANNER_SHORT_INTEREST_PROVIDER` | Optional premium short-interest provider name, or `disabled` to keep Yahoo public short-interest fields. |
+| `SQUEEZE_SCANNER_CORPORATE_ACTIONS_PROVIDER` | Optional premium corporate-action provider name, or `disabled`. |
+| `SQUEEZE_SCANNER_FILINGS_PROVIDER` | Optional filing-derived float/dilution provider name, or `disabled`. |
+| `SQUEEZE_SCANNER_EVENT_PROVIDER` | Optional halt/news/event provider name, or `disabled`. |
+| `SQUEEZE_SCANNER_ALERT_DELIVERY_CHANNELS` | Optional comma-separated default alert channels for new alerts, such as `noop` for dry-run or `webhook` for POST delivery. Blank keeps external delivery disabled. |
+| `SQUEEZE_SCANNER_ALERT_WEBHOOK_URL` | Optional webhook endpoint for the `webhook` alert channel. Keep credentials in `.env`, not source control. |
+| `SQUEEZE_SCANNER_ALERT_WEBHOOK_TIMEOUT_SECONDS` | Timeout for webhook alert delivery attempts. |
+| `SQUEEZE_SCANNER_PUBLIC_BASE_URL` | Optional browser URL included in external alert messages. |
 
 ## Run
 
@@ -89,6 +102,7 @@ src/squeeze_scanner/
   cache.py              SQLite raw market data cache
   config.py             .env loading and runtime settings
   domain.py             shared dataclasses, protocols, and errors
+  providers/premium.py  optional premium-provider seams and status metadata
   providers/yahoo.py    yfinance/Yahoo Finance adapter
   screens.py            SQLite saved screens and watchlists
   scoring.py            four-model metadata and scoring logic
@@ -136,7 +150,7 @@ The scanner uses `squeeze-v3`, which returns four independent 0-100 model scores
 | Gamma Candidate | Heavy call buying, dealer gamma exposure | Options-driven names where call activity and public-options exposure may force dealer hedging flows. |
 | Hybrid | Tiny float, short interest, borrow fee, options activity | Rare names combining compressed supply, high short pressure, costly borrow, and elevated options activity. |
 
-Yahoo Finance does not provide borrow fees or true dealer positioning. Borrow-fee fields score zero until an external securities-lending feed populates `borrow_fee_pct`; dealer gamma uses a public option-chain exposure proxy when options data is available.
+Yahoo Finance does not provide borrow fees, halt/event feeds, filing-derived dilution risk, or true dealer positioning. Borrow-fee fields score zero until an external securities-lending feed populates `borrow_fee_pct`; Yahoo options populate a public option-chain exposure proxy, while provider-backed option records with greeks populate separate true-GEX fields when an adapter supplies them. Optional premium provider names can be selected in `.env`, but unimplemented or uncredentialed providers fail explicitly, add source warnings/provenance, and do not create bullish scores.
 
 The frontend reads this metadata from `GET /api/model` and from the `model` block included in scan responses. To change the UX legend/tooltips, update `SCORING_MODELS` in `src/squeeze_scanner/scoring.py`.
 
@@ -145,7 +159,10 @@ The frontend reads this metadata from `GET /api/model` and from the `model` bloc
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/` | Website front-end |
-| `GET` | `/api/health` | Health check |
+| `GET` | `/api/health` | Structured health check with cache, provider, scheduler, and automation status |
+| `GET` | `/api/status` | Detailed operational status payload equivalent to health |
+| `GET` | `/api/scheduler/status` | In-process scheduler state, poll counters, and schedule/run summary |
+| `GET` | `/api/providers` | Provider status, capability metadata, and optional premium feed configuration state |
 | `GET` | `/api/model` | Current scoring model metadata used by the UI legend and tooltips |
 | `GET` | `/api/scans/recent` | Scores tickers screened within the last hour from latest cached raw snapshots |
 | `GET` | `/api/scans/history` | Queries stored historical score rows across symbols |
@@ -170,15 +187,23 @@ The frontend reads this metadata from `GET /api/model` and from the `model` bloc
 | `PATCH`/`DELETE` | `/api/alerts/{alert_id}` | Updates or deletes an alert rule |
 | `GET` | `/api/alert-events` | Lists alert events |
 | `POST` | `/api/alert-events/{event_id}/ack` | Acknowledges an alert event |
+| `GET` | `/api/alert-delivery-attempts` | Lists external alert delivery status/failures |
+| `POST` | `/api/alert-delivery-attempts/{attempt_id}/retry` | Retries one persisted alert delivery attempt |
 | `GET` | `/api/reports` | Lists historical report endpoints |
 | `GET` | `/api/reports/top-new-high-setups` | Reports new high setup rows |
 | `GET` | `/api/reports/biggest-1h-increases` | Reports biggest 1-hour score increases |
 | `GET` | `/api/reports/biggest-24h-increases` | Reports biggest 24-hour score increases |
 | `GET` | `/api/reports/repeated-high-setups` | Reports repeated high setup rows |
 | `GET` | `/api/reports/deterioration` | Reports score deterioration rows |
-| `GET` | `/api/reports/calibration` | Reports backtest calibration buckets |
+| `GET` | `/api/reports/calibration` | Reports backtest calibration buckets, optionally sliced by source quality |
+| `GET` | `/api/reports/model-version-comparison` | Compares paired outcomes for two scoring model versions |
+| `GET` | `/api/reports/gamma-threshold-review` | Reviews outcome buckets for gamma-specific threshold metrics |
 
 Scan endpoints accept optional `ranking_mode`, `selected_model`, and `sort_direction` fields or query parameters, depending on the endpoint.
+
+Report endpoints return JSON by default. Add `format=csv` to export visible report rows for spreadsheet or notebook analysis.
+
+Screens, watchlists, schedules, and alerts accept optional `owner_id` metadata and owner filters for auth/user isolation integration. Leaving `owner_id` blank is the default local mode and lists all local resources.
 
 Example:
 
@@ -194,10 +219,19 @@ Yahoo most-shorted example:
 curl -X POST "http://${SQUEEZE_SCANNER_HOST:-127.0.0.1}:${SQUEEZE_SCANNER_PORT:-7890}/api/scan/most-shorted?count=100"
 ```
 
+Alert delivery remains in-app only unless a channel is configured. To dry-run delivery for new alerts, set
+`SQUEEZE_SCANNER_ALERT_DELIVERY_CHANNELS=noop`. To send webhooks, set
+`SQUEEZE_SCANNER_ALERT_DELIVERY_CHANNELS=webhook` and keep `SQUEEZE_SCANNER_ALERT_WEBHOOK_URL` in `.env`.
+Per-alert `delivery_channels` can override the default; use an empty list for in-app only.
+
 ## Test
 
 ```bash
 uv run pytest
 ```
+
+## Documentation
+
+The detailed repository documentation suite lives in [`documentation/`](documentation/README.md). It covers architecture/data flow, scoring/options/providers, API automation/alerts, operations/testing, and an AI-agent context guide.
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the component diagram and data flow.

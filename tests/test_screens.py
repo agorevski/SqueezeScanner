@@ -89,6 +89,82 @@ def test_saved_screen_crud_persists_structured_filters(tmp_path):
     assert ScreenStore(db_path).list_screens() == []
 
 
+def test_saved_screens_and_watchlists_support_optional_owner_scope(tmp_path):
+    db_path = tmp_path / "scanner.sqlite3"
+    store = ScreenStore(db_path)
+
+    local_screen = store.create_screen("Local", {"symbols": ["GME"]})
+    owned_screen = store.create_screen("Owned", {"symbols": ["AMC"]}, owner_id="alice")
+    local_watchlist = store.create_watchlist("Local list", ["GME"])
+    owned_watchlist = store.create_watchlist("Owned list", ["AMC"], owner_id="alice")
+
+    assert local_screen["owner_id"] is None
+    assert owned_screen["owner_id"] == "alice"
+    assert local_watchlist["owner_id"] is None
+    assert owned_watchlist["owner_id"] == "alice"
+    assert [screen["name"] for screen in store.list_screens(owner_id="alice")] == ["Owned"]
+    assert [watchlist["name"] for watchlist in store.list_watchlists(owner_id="alice")] == ["Owned list"]
+    assert store.list_watchlist_symbols(local_watchlist["id"], owner_id="alice") is None
+
+
+def test_owner_columns_are_added_to_existing_screen_tables(tmp_path):
+    db_path = tmp_path / "scanner.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE saved_screens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                filters_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE watchlists (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE watchlist_symbols (
+                watchlist_id INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (watchlist_id, symbol)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO saved_screens (name, filters_json, created_at, updated_at)
+            VALUES ('Legacy', '{}', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO watchlists (name, created_at, updated_at)
+            VALUES ('Legacy list', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')
+            """
+        )
+
+    store = ScreenStore(db_path)
+
+    assert store.list_screens()[0]["owner_id"] is None
+    assert store.list_watchlists()[0]["owner_id"] is None
+    with sqlite3.connect(db_path) as connection:
+        screen_columns = {row[1] for row in connection.execute("PRAGMA table_info(saved_screens)")}
+        watchlist_columns = {row[1] for row in connection.execute("PRAGMA table_info(watchlists)")}
+    assert "owner_id" in screen_columns
+    assert "owner_id" in watchlist_columns
+
+
 def test_watchlist_crud_and_scan_uses_persisted_symbols(tmp_path):
     class RecordingScanner:
         def __init__(self) -> None:

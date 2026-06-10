@@ -749,7 +749,7 @@ function watchlistSymbols(watchlist) {
 }
 
 function loadRoadmapPanels() {
-  loadRoadmapPanel(alertsPanelBodyEl, "Alerts", ["/api/alerts", "/api/alert-events", "/api/alerts/events"], [
+  loadRoadmapPanel(alertsPanelBodyEl, "Alerts", ["/api/alerts", "/api/alert-events", "/api/alert-delivery-attempts"], [
     "alerts",
     "alert_events",
     "events",
@@ -1345,6 +1345,7 @@ function renderResultCard(result) {
         ${activeModelKeys(result).map((key) => modelScoreTile(result, key)).join("")}
       </div>
       ${renderDeltaGrid(result)}
+      ${renderGammaDetails(result)}
       ${renderRiskSection(result)}
       ${renderModelBreakdowns(result)}
       ${warnings}
@@ -1395,6 +1396,54 @@ function renderRiskSection(result) {
       <span>Risk flags & guardrails</span>
       ${badges || `<p>No risk flags returned.</p>`}
       ${warnings.length ? `<p>${escapeHtml(warnings.join(" "))}</p>` : ""}
+    </div>
+  `;
+}
+
+function renderGammaDetails(result) {
+  const metrics = result.metrics || {};
+  const hasGammaDetail = [
+    metrics.gamma_exposure_source_type,
+    metrics.gamma_exposure_pct_market_cap,
+    metrics.dealer_gamma_exposure_pct_market_cap,
+    metrics.net_gamma_exposure,
+    metrics.near_gamma_exposure,
+    metrics.gamma_flip_distance_pct,
+    metrics.call_gamma_share_pct,
+    metrics.call_wall_strike,
+    metrics.put_wall_strike,
+    metrics.largest_gamma_expiration,
+    metrics.net_open_interest_change,
+  ].some((value) => value !== undefined && value !== null && value !== "");
+  if (!hasGammaDetail) {
+    return "";
+  }
+
+  const items = [
+    ["Source", gammaSourceLabel(metrics)],
+    ["GEX % cap", formatPercent(firstDefined(metrics.gamma_exposure_pct_market_cap, metrics.dealer_gamma_exposure_pct_market_cap))],
+    ["Net GEX", formatCompact(metrics.net_gamma_exposure)],
+    ["Near GEX", formatCompact(metrics.near_gamma_exposure)],
+    ["Flip", formatPercent(metrics.gamma_flip_distance_pct)],
+    ["Call gamma", formatPercent(metrics.call_gamma_share_pct)],
+    ["Call wall", formatStrikeDistance(metrics.call_wall_strike, metrics.call_wall_distance_pct)],
+    ["Put wall", formatStrikeDistance(metrics.put_wall_strike, metrics.put_wall_distance_pct)],
+    ["Largest expiry", formatGammaExpiration(metrics)],
+    ["OI Δ", formatSignedCompact(metrics.net_open_interest_change)],
+  ].filter(([, value]) => value && value !== "N/A");
+
+  if (!items.length) {
+    return "";
+  }
+
+  return `
+    <div class="risk-section gamma-details">
+      <span>Gamma details</span>
+      <div class="risk-flags">
+        ${items
+          .map(([label, value]) => `<span class="risk-badge info" title="${escapeHtml(label)}">${escapeHtml(label)}: ${escapeHtml(value)}</span>`)
+          .join("")}
+      </div>
     </div>
   `;
 }
@@ -1969,6 +2018,42 @@ function formatRankValue(result, ranking) {
   if (ranking.mode === "short_interest") return formatPercent(value);
   if (ranking.mode === "smallest_float") return formatCompact(value);
   return formatNumber(value);
+}
+
+function gammaSourceLabel(metrics) {
+  const sourceType = metrics.gamma_exposure_source_type;
+  const sourceName = metrics.gamma_exposure_source ? ` (${metrics.gamma_exposure_source})` : "";
+  if (sourceType === "true_greeks") return `true greeks${sourceName}`;
+  if (sourceType === "proxy") return `proxy${sourceName}`;
+  return "missing";
+}
+
+function formatStrikeDistance(strike, distancePct) {
+  if (strike === null || strike === undefined || Number.isNaN(strike)) {
+    return "N/A";
+  }
+  const distance = distancePct === null || distancePct === undefined || Number.isNaN(distancePct)
+    ? ""
+    : ` (${numberFormatter.format(Math.abs(distancePct))}% ${distancePct >= 0 ? "above" : "below"})`;
+  return `${formatCurrency(strike)}${distance}`;
+}
+
+function formatGammaExpiration(metrics) {
+  if (!metrics.largest_gamma_expiration) {
+    return "N/A";
+  }
+  const dte = metrics.largest_gamma_expiration_days_to_expiration;
+  return dte === null || dte === undefined || Number.isNaN(dte)
+    ? String(metrics.largest_gamma_expiration)
+    : `${metrics.largest_gamma_expiration} (${numberFormatter.format(dte)} DTE)`;
+}
+
+function formatSignedCompact(value) {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return "N/A";
+  }
+  const prefix = value > 0 ? "+" : "";
+  return `${prefix}${formatCompact(value)}`;
 }
 
 function formatNumber(value) {

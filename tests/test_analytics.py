@@ -36,6 +36,8 @@ def add_score(
     metrics: dict | None = None,
     components: dict | None = None,
     risk_flags: list[str] | None = None,
+    data_quality: float = 100,
+    scoring_model_version: str = "test-v1",
 ) -> int:
     return store.insert_score_history(
         {
@@ -43,7 +45,7 @@ def add_score(
             "company_name": f"{symbol} Inc",
             "score": score,
             "risk_level": "High setup" if score >= 70 else "Watchlist",
-            "data_quality": 100,
+            "data_quality": data_quality,
             "primary_model": model,
             "model_scores": {model: score},
             "model_components": components or {model: {"relative_volume": score / 2}},
@@ -51,7 +53,7 @@ def add_score(
             "risk_flags": risk_flags or [],
         },
         created_at=created_at,
-        scoring_model_version="test-v1",
+        scoring_model_version=scoring_model_version,
     )
 
 
@@ -119,6 +121,154 @@ def test_calibration_report_buckets_returns_and_win_rate(store):
             "worst_max_adverse_excursion_pct": 20,
         },
     ]
+
+
+def test_calibration_report_can_slice_by_source_quality(store):
+    scenarios = [
+        (
+            "YHOO",
+            {"price": 10, "avg_volume_20d": 1_000_000, "option_chain_provider": "yahoo_finance"},
+            [],
+            100,
+        ),
+        (
+            "TRUE",
+            {
+                "price": 10,
+                "avg_volume_20d": 1_000_000,
+                "option_chain_provider": "test_options",
+                "option_chain_capabilities": {"gamma": True, "true_gamma_exposure": True},
+            },
+            [],
+            100,
+        ),
+        ("BORR", {"price": 10, "avg_volume_20d": 1_000_000, "borrow_fee_pct": 35}, [], 100),
+        (
+            "STALE",
+            {
+                "price": 10,
+                "avg_volume_20d": 1_000_000,
+                "option_chain_freshness_seconds": 7_200,
+                "option_chain_stale_after_seconds": 3_600,
+            },
+            [],
+            100,
+        ),
+        ("MISS", {"price": 10, "avg_volume_20d": 1_000_000}, ["missing_data"], 80),
+    ]
+    for symbol, metrics, risk_flags, data_quality in scenarios:
+        add_score(
+            store,
+            symbol,
+            82,
+            BASE,
+            model="gamma_candidate",
+            metrics=metrics,
+            risk_flags=risk_flags,
+            data_quality=data_quality,
+        )
+        store.insert_price_bar(PriceBar(symbol, BASE + timedelta(days=1), close=11))
+    store.compute_due_outcomes(as_of=BASE + timedelta(days=1), horizons={"1d": 86_400})
+
+    report = store.calibration_report(model="gamma_candidate", horizon="1d", slice_by_source_quality=True)
+    slices = {row["source_quality_slice"] for row in report}
+
+    assert {"yahoo_only", "true_options_greeks", "premium_borrow", "stale_data", "missing_data"} <= slices
+    assert all(row["score_bucket"] == "80-90" for row in report)
+
+    missing_only = store.calibration_report(
+        model="gamma_candidate",
+        horizon="1d",
+        slice_by_source_quality=True,
+        source_quality_slice="missing-data",
+    )
+    assert {row["source_quality_slice"] for row in missing_only} == {"missing_data"}
+
+
+def test_model_version_comparison_pairs_same_historical_outcome(store):
+    add_score(
+        store,
+        "PAIR",
+        62,
+        BASE,
+        model="hybrid",
+        scoring_model_version="squeeze-v3",
+        metrics={"price": 10, "avg_volume_20d": 1_000_000},
+    )
+    add_score(
+        store,
+        "PAIR",
+        84,
+        BASE,
+        model="hybrid",
+        scoring_model_version="squeeze-v4-gamma",
+        metrics={"price": 10, "avg_volume_20d": 1_000_000},
+    )
+    store.insert_price_bar(PriceBar("PAIR", BASE + timedelta(days=1), close=9, high=12, low=8))
+    store.compute_due_outcomes(as_of=BASE + timedelta(days=1), horizons={"1d": 86_400})
+
+    rows = store.report_model_version_comparison(
+        model="hybrid",
+        horizon="1d",
+        base_version="squeeze-v3",
+        compare_version="squeeze-v4-gamma",
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["base_score"] == 62
+    assert row["compare_score"] == 84
+    assert row["score_delta"] == 22
+    assert row["base_score_bucket"] == "60-70"
+    assert row["compare_score_bucket"] == "80-90"
+    assert row["forward_return_pct"] == -10
+    assert row["max_favorable_excursion_pct"] == 20
+    assert row["max_adverse_excursion_pct"] == -20
+    assert row["compare_deteriorated"] is True
+
+
+def test_gamma_threshold_review_derives_metrics_and_keeps_missing_bucket(store):
+    add_score(
+        store,
+        "GEX",
+        88,
+        BASE,
+        model="gamma_candidate",
+        metrics={
+            "price": 10,
+            "avg_volume_20d": 1_000_000,
+            "market_cap": 100_000_000,
+            "net_gamma_exposure": 5_000_000,
+            "absolute_gamma_exposure": 12_000_000,
+            "call_wall_strike": 12,
+            "put_wall_strike": 8,
+            "open_interest_change": 125,
+        },
+    )
+    add_score(
+        store,
+        "NOGEX",
+        82,
+        BASE,
+        model="gamma_candidate",
+        metrics={"price": 10, "avg_volume_20d": 1_000_000},
+    )
+    store.insert_price_bar(PriceBar("GEX", BASE + timedelta(days=1), close=11))
+    store.insert_price_bar(PriceBar("NOGEX", BASE + timedelta(days=1), close=9))
+    store.compute_due_outcomes(as_of=BASE + timedelta(days=1), horizons={"1d": 86_400})
+
+    rows = store.report_gamma_threshold_review(
+        model="gamma_candidate",
+        horizon="1d",
+        metrics=["net_gamma_exposure_pct_market_cap", "call_wall_distance_pct", "open_interest_change"],
+        bucket_size=10,
+    )
+    rows_by_metric_bucket = {(row["metric"], row["metric_bucket"]): row for row in rows}
+
+    assert rows_by_metric_bucket[("net_gamma_exposure_pct_market_cap", "0-10")]["avg_metric_value"] == 5
+    assert rows_by_metric_bucket[("call_wall_distance_pct", "20-30")]["avg_metric_value"] == 20
+    assert rows_by_metric_bucket[("open_interest_change", "120-130")]["avg_metric_value"] == 125
+    assert rows_by_metric_bucket[("net_gamma_exposure_pct_market_cap", "missing")]["missing_count"] == 1
 
 
 def test_delta_explanations_are_structured_and_deterministic(store):
@@ -249,6 +399,87 @@ def test_reports_api_uses_persisted_history_and_delta_explanations(tmp_path, mon
         previous = deltas["windows"][0]
         assert previous["status"] == "ok"
         assert previous["score_delta"] == 32
+    finally:
+        get_settings.cache_clear()
+
+
+def test_reporting_upgrade_routes_expose_json_and_csv_outputs(tmp_path, monkeypatch):
+    db_path = tmp_path / "scanner.sqlite3"
+    monkeypatch.setenv("SQUEEZE_SCANNER_CACHE_DB", str(db_path))
+    get_settings.cache_clear()
+    try:
+        store = AnalyticsStore(db_path)
+        for version, score in [("squeeze-v3", 55), ("squeeze-v4-gamma", 85)]:
+            add_score(
+                store,
+                "ROUTE",
+                score,
+                BASE,
+                model="gamma_candidate",
+                scoring_model_version=version,
+                metrics={
+                    "price": 10,
+                    "avg_volume_20d": 1_000_000,
+                    "market_cap": 100_000_000,
+                    "net_gamma_exposure": 5_000_000,
+                    "gamma_flip_distance_pct": -3,
+                    "option_chain_provider": "test_options",
+                    "option_chain_capabilities": {"gamma": True, "true_gamma_exposure": True},
+                },
+            )
+        store.insert_price_bar(PriceBar("ROUTE", BASE + timedelta(days=1), close=11, high=12, low=9))
+        store.compute_due_outcomes(as_of=BASE + timedelta(days=1), horizons={"1d": 86_400})
+
+        app = create_app()
+        catalog = asyncio.run(_route_endpoint(app, "/api/reports")())
+        paths = {report["path"] for report in catalog["reports"]}
+        assert "/api/reports/model-version-comparison" in paths
+        assert "/api/reports/gamma-threshold-review" in paths
+
+        comparison = asyncio.run(
+            _route_endpoint(app, "/api/reports/model-version-comparison")(
+                model="gamma_candidate",
+                horizon="1d",
+                base_version="squeeze-v3",
+                compare_version="squeeze-v4-gamma",
+                bucket_size=10,
+                deterioration_threshold_pct=0,
+                limit=50,
+                offset=0,
+                format="json",
+            )
+        )
+        assert comparison["report"] == "model_version_comparison"
+        assert comparison["rows"][0]["score_delta"] == 30
+
+        calibration = asyncio.run(
+            _route_endpoint(app, "/api/reports/calibration")(
+                model="gamma_candidate",
+                horizon="1d",
+                bucket_size=10,
+                scoring_model_version="squeeze-v4-gamma",
+                slice_by_source_quality=True,
+                source_quality_slice="true_options_greeks",
+                format="json",
+            )
+        )
+        assert calibration["rows"][0]["source_quality_slice"] == "true_options_greeks"
+
+        csv_response = asyncio.run(
+            _route_endpoint(app, "/api/reports/gamma-threshold-review")(
+                model="gamma_candidate",
+                horizon="1d",
+                metrics="net_gamma_exposure_pct_market_cap,gamma_flip_distance_pct",
+                bucket_size=5,
+                scoring_model_version="squeeze-v4-gamma",
+                include_missing=True,
+                limit=50,
+                offset=0,
+                format="csv",
+            )
+        )
+        assert csv_response.media_type == "text/csv"
+        assert "net_gamma_exposure_pct_market_cap" in csv_response.body.decode()
     finally:
         get_settings.cache_clear()
 

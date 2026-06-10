@@ -5,6 +5,12 @@ from datetime import datetime, timezone
 from typing import Any, Sequence
 
 from .domain import GuardrailConfig, ScanResult, TickerSnapshot
+from .options import (
+    CONTRACT_MULTIPLIER,
+    GAMMA_EXPOSURE_PERCENT_MOVE,
+    YAHOO_OPTION_PROXY_SOURCE,
+    snapshot_with_true_gamma_metrics,
+)
 
 SCORING_MODEL_VERSION = "squeeze-v3"
 SCORE_MAX = 100.0
@@ -98,14 +104,14 @@ SCORING_MODELS: list[dict[str, Any]] = [
         "category": "Category 3",
         "label": "Gamma Candidate",
         "definition": (
-            "Options-driven names where heavy call buying and large public-options gamma exposure may "
-            "force dealer hedging flows."
+            "Options-driven names where heavy call demand, provider-backed gamma exposure, nearby "
+            "gamma flips, and strike/expiry concentration may force dealer hedging flows."
         ),
         "signals": [
             {
                 "key": "call_buying",
                 "label": "Heavy call buying",
-                "weight": 50.0,
+                "weight": 30.0,
                 "means": "Call-option volume and call/put volume skew from the available option chain.",
                 "calculation": (
                     "Scores total call volume and adds credit for call volume that materially exceeds put volume."
@@ -114,14 +120,60 @@ SCORING_MODELS: list[dict[str, Any]] = [
             },
             {
                 "key": "dealer_gamma_exposure",
-                "label": "Dealer gamma exposure",
-                "weight": 50.0,
-                "means": "A public-data proxy for option exposure that may require dealer hedging.",
+                "label": "True/proxy gamma exposure",
+                "weight": 35.0,
+                "means": "Provider-backed true gamma exposure when greeks are available, otherwise a labeled public-data proxy.",
                 "calculation": (
-                    "Uses dealer_gamma_exposure_proxy when available; the Yahoo adapter estimates this from "
-                    "near-the-money option open interest, while true dealer positioning requires specialist data."
+                    "Uses near-dated and total true gamma exposure as a percent of market cap when provider records "
+                    "include greeks/open interest. If only Yahoo/public option data is present, uses "
+                    "dealer_gamma_exposure_proxy without treating it as true GEX."
                 ),
                 "favorable": "Higher exposure relative to market cap is more favorable.",
+            },
+            {
+                "key": "gamma_flip_proximity",
+                "label": "Gamma flip proximity",
+                "weight": 10.0,
+                "means": "How close spot is to the provider-backed gamma flip level.",
+                "calculation": (
+                    "Scores the absolute gamma_flip_distance_pct. Points require true greeks; proxy-only snapshots "
+                    "receive no gamma-flip credit."
+                ),
+                "favorable": "A gamma flip within a few percent of spot is more favorable.",
+            },
+            {
+                "key": "call_put_gamma_skew",
+                "label": "Call/put gamma skew",
+                "weight": 10.0,
+                "means": "Whether call gamma dominates put gamma, with a public open-interest fallback.",
+                "calculation": (
+                    "Uses call_gamma_exposure versus put_gamma_exposure when true greeks are available; otherwise "
+                    "falls back to call open-interest share so Yahoo proxy snapshots remain usable."
+                ),
+                "favorable": "Higher call-gamma or call-open-interest share is more favorable.",
+            },
+            {
+                "key": "gamma_concentration_walls",
+                "label": "Gamma walls/concentration",
+                "weight": 10.0,
+                "means": "Strike and expiry concentration around call/put walls and the largest gamma strike.",
+                "calculation": (
+                    "Blends gamma_strike_concentration_pct, gamma_expiration_concentration_pct, call/put wall "
+                    "distance from spot, max gamma strike distance, and largest gamma expiration. Proxy-only "
+                    "snapshots use call open interest and call-open-interest share as a weaker fallback."
+                ),
+                "favorable": "Concentrated, near-spot call walls and near-dated expirations are more favorable.",
+            },
+            {
+                "key": "open_interest_change",
+                "label": "Open-interest change",
+                "weight": 5.0,
+                "means": "Whether new option open interest is building in the available chain.",
+                "calculation": (
+                    "Aggregates provider open_interest_change by side and scores positive call OI growth. "
+                    "No points are awarded when OI-change data is missing."
+                ),
+                "favorable": "Positive call OI change, especially versus put OI change, is more favorable.",
             },
         ],
     },
@@ -208,6 +260,7 @@ def scoring_model_metadata() -> dict[str, Any]:
 
 
 def score_snapshot(snapshot: TickerSnapshot) -> ScanResult:
+    snapshot = snapshot_with_true_gamma_metrics(snapshot)
     model_components = _score_models(snapshot)
     model_scores = {
         model_key: round(sum(components.values()), 1)
@@ -224,7 +277,18 @@ def score_snapshot(snapshot: TickerSnapshot) -> ScanResult:
     if missing:
         warnings.append(f"Missing fields reduced confidence: {', '.join(missing)}")
 
-    metrics: dict[str, float | bool | None] = {
+    option_chain_capabilities = (
+        snapshot.option_chain_capabilities
+        if isinstance(snapshot.option_chain_capabilities, dict)
+        else {}
+    )
+    option_chain_records = (
+        snapshot.option_chain_records
+        if isinstance(snapshot.option_chain_records, list)
+        else []
+    )
+    gamma_detail_metrics = _gamma_detail_metrics(snapshot)
+    metrics: dict[str, Any] = {
         "price": snapshot.price,
         "change_1d_pct": snapshot.change_1d_pct,
         "change_5d_pct": snapshot.change_5d_pct,
@@ -238,13 +302,29 @@ def score_snapshot(snapshot: TickerSnapshot) -> ScanResult:
         "short_ratio": snapshot.short_ratio,
         "shares_short": snapshot.shares_short,
         "shares_short_prior_month": snapshot.shares_short_prior_month,
+        "short_interest_settlement_date": snapshot.short_interest_settlement_date,
+        "short_interest_reported_at": snapshot.short_interest_reported_at,
+        "short_interest_revised_at": snapshot.short_interest_revised_at,
+        "short_interest_revision_id": snapshot.short_interest_revision_id,
         "short_interest_change_pct": _short_interest_change(snapshot),
         "float_shares": snapshot.float_shares,
         "market_cap": snapshot.market_cap,
         "borrow_fee_pct": snapshot.borrow_fee_pct,
+        "borrow_available_shares": snapshot.borrow_available_shares,
+        "borrow_utilization_pct": snapshot.borrow_utilization_pct,
+        "borrow_rebate_rate_pct": snapshot.borrow_rebate_rate_pct,
+        "borrow_fetched_at": snapshot.borrow_fetched_at,
         "recent_reverse_split": snapshot.recent_reverse_split,
         "days_since_reverse_split": snapshot.days_since_reverse_split,
         "reverse_split_ratio": snapshot.reverse_split_ratio,
+        "dilution_risk": snapshot.dilution_risk,
+        "offering_risk": snapshot.offering_risk,
+        "warrant_overhang_risk": snapshot.warrant_overhang_risk,
+        "atm_program_risk": snapshot.atm_program_risk,
+        "active_trading_halt": snapshot.active_trading_halt,
+        "halt_risk": snapshot.halt_risk,
+        "material_news_event": snapshot.material_news_event,
+        "event_risk": snapshot.event_risk,
         "call_volume": snapshot.call_volume,
         "put_volume": snapshot.put_volume,
         "call_put_volume_ratio": _call_put_volume_ratio(snapshot),
@@ -252,6 +332,27 @@ def score_snapshot(snapshot: TickerSnapshot) -> ScanResult:
         "put_open_interest": snapshot.put_open_interest,
         "dealer_gamma_exposure_proxy": snapshot.dealer_gamma_exposure_proxy,
         "dealer_gamma_exposure_pct_market_cap": _dealer_gamma_pct_market_cap(snapshot),
+        "call_gamma_exposure": snapshot.call_gamma_exposure,
+        "put_gamma_exposure": snapshot.put_gamma_exposure,
+        "net_gamma_exposure": snapshot.net_gamma_exposure,
+        "absolute_gamma_exposure": snapshot.absolute_gamma_exposure,
+        "gamma_exposure_pct_market_cap": _gamma_exposure_pct_market_cap(snapshot),
+        "gamma_flip_price": snapshot.gamma_flip_price,
+        "gamma_flip_distance_pct": snapshot.gamma_flip_distance_pct,
+        "max_gamma_strike": snapshot.max_gamma_strike,
+        "call_wall_strike": snapshot.call_wall_strike,
+        "put_wall_strike": snapshot.put_wall_strike,
+        "largest_gamma_expiration": snapshot.largest_gamma_expiration,
+        "gamma_strike_concentration_pct": snapshot.gamma_strike_concentration_pct,
+        "gamma_expiration_concentration_pct": snapshot.gamma_expiration_concentration_pct,
+        "option_chain_source": snapshot.option_chain_source,
+        "option_chain_provider": snapshot.option_chain_provider,
+        "option_chain_fetched_at": snapshot.option_chain_fetched_at,
+        "option_chain_freshness_seconds": snapshot.option_chain_freshness_seconds,
+        "option_chain_stale_after_seconds": snapshot.option_chain_stale_after_seconds,
+        "option_chain_capabilities": dict(option_chain_capabilities),
+        "option_chain_contract_count": len(option_chain_records) if option_chain_records else None,
+        **gamma_detail_metrics,
         "distance_from_52_week_high_pct": snapshot.distance_from_52_week_high_pct,
     }
     rounded_components = {
@@ -314,6 +415,22 @@ def _score_models(snapshot: TickerSnapshot) -> dict[str, dict[str, float]]:
             "dealer_gamma_exposure": _score_dealer_gamma_exposure(
                 snapshot,
                 gamma_weights["dealer_gamma_exposure"],
+            ),
+            "gamma_flip_proximity": _score_gamma_flip_proximity(
+                snapshot,
+                gamma_weights["gamma_flip_proximity"],
+            ),
+            "call_put_gamma_skew": _score_call_put_gamma_skew(
+                snapshot,
+                gamma_weights["call_put_gamma_skew"],
+            ),
+            "gamma_concentration_walls": _score_gamma_concentration_walls(
+                snapshot,
+                gamma_weights["gamma_concentration_walls"],
+            ),
+            "open_interest_change": _score_open_interest_change(
+                snapshot,
+                gamma_weights["open_interest_change"],
             ),
         },
         "hybrid": {
@@ -443,11 +560,36 @@ def _score_call_buying(snapshot: TickerSnapshot, weight: float) -> float:
 
 
 def _score_dealer_gamma_exposure(snapshot: TickerSnapshot, weight: float) -> float:
-    if snapshot.dealer_gamma_exposure_proxy is None:
+    exposure_value = _scoring_gamma_exposure_value(snapshot)
+    exposure_pct_market_cap = _scoring_gamma_exposure_pct_market_cap(snapshot)
+    near_gamma_pct_market_cap = _near_gamma_metrics(snapshot)["pct_market_cap"]
+    if exposure_value is None and exposure_pct_market_cap is None:
         return 0.0
 
-    exposure_pct_market_cap = _dealer_gamma_pct_market_cap(snapshot)
     if exposure_pct_market_cap is not None:
+        base_score = _piecewise_score(
+            exposure_pct_market_cap,
+            (
+                (0.0, 0.0),
+                (1.0, weight * 0.2),
+                (3.0, weight * 0.45),
+                (7.0, weight * 0.75),
+                (12.0, weight),
+            ),
+        )
+        if near_gamma_pct_market_cap is not None:
+            near_score = _piecewise_score(
+                near_gamma_pct_market_cap,
+                (
+                    (0.0, 0.0),
+                    (0.5, weight * 0.05),
+                    (1.5, weight * 0.08),
+                    (3.0, weight * 0.1),
+                ),
+            )
+            return min(weight, base_score + near_score)
+        if _has_provider_backed_true_gamma(snapshot):
+            return min(weight, base_score)
         return _piecewise_score(
             exposure_pct_market_cap,
             (
@@ -460,7 +602,7 @@ def _score_dealer_gamma_exposure(snapshot: TickerSnapshot, weight: float) -> flo
         )
 
     return _piecewise_score(
-        snapshot.dealer_gamma_exposure_proxy,
+        exposure_value,
         (
             (0.0, 0.0),
             (10_000_000.0, weight * 0.2),
@@ -469,6 +611,142 @@ def _score_dealer_gamma_exposure(snapshot: TickerSnapshot, weight: float) -> flo
             (1_000_000_000.0, weight),
         ),
     )
+
+
+def _score_gamma_flip_proximity(snapshot: TickerSnapshot, weight: float) -> float:
+    if not _has_provider_backed_true_gamma(snapshot) or snapshot.gamma_flip_distance_pct is None:
+        return 0.0
+    return _piecewise_score(
+        abs(snapshot.gamma_flip_distance_pct),
+        (
+            (0.0, weight),
+            (1.0, weight),
+            (3.0, weight * 0.7),
+            (7.0, weight * 0.35),
+            (15.0, weight * 0.1),
+            (30.0, 0.0),
+        ),
+    )
+
+
+def _score_call_put_gamma_skew(snapshot: TickerSnapshot, weight: float) -> float:
+    if _has_provider_backed_true_gamma(snapshot):
+        call_share = _call_gamma_share_pct(snapshot)
+        if call_share is None:
+            return 0.0
+        return _piecewise_score(
+            call_share,
+            (
+                (0.0, 0.0),
+                (50.0, 0.0),
+                (60.0, weight * 0.3),
+                (75.0, weight * 0.7),
+                (90.0, weight),
+            ),
+        )
+
+    call_share = _call_open_interest_share_pct(snapshot)
+    if call_share is None:
+        return 0.0
+    return _piecewise_score(
+        call_share,
+        (
+            (0.0, 0.0),
+            (50.0, 0.0),
+            (65.0, weight * 0.35),
+            (80.0, weight * 0.75),
+            (90.0, weight),
+        ),
+    )
+
+
+def _score_gamma_concentration_walls(snapshot: TickerSnapshot, weight: float) -> float:
+    if _has_provider_backed_true_gamma(snapshot):
+        concentration = _gamma_concentration_pct(snapshot)
+        concentration_score = _piecewise_score(
+            concentration,
+            (
+                (0.0, 0.0),
+                (20.0, weight * 0.15),
+                (35.0, weight * 0.3),
+                (50.0, weight * 0.45),
+                (70.0, weight * 0.55),
+            ),
+        )
+        call_wall_score = _score_call_wall_distance(
+            _distance_pct(snapshot.call_wall_strike, snapshot.price),
+            weight * 0.25,
+        )
+        put_wall_score = _score_put_wall_distance(
+            _distance_pct(snapshot.put_wall_strike, snapshot.price),
+            weight * 0.1,
+        )
+        max_strike_score = _score_near_strike_distance(
+            _distance_pct(snapshot.max_gamma_strike, snapshot.price),
+            weight * 0.1,
+        )
+        expiry_score = _score_near_gamma_expiration(snapshot, weight * 0.1)
+        return min(
+            weight,
+            concentration_score + call_wall_score + put_wall_score + max_strike_score + expiry_score,
+        )
+
+    call_open_interest_score = _piecewise_score(
+        snapshot.call_open_interest,
+        (
+            (0.0, 0.0),
+            (1_000.0, weight * 0.1),
+            (10_000.0, weight * 0.25),
+            (50_000.0, weight * 0.45),
+            (100_000.0, weight * 0.6),
+        ),
+    )
+    call_share_score = _piecewise_score(
+        _call_open_interest_share_pct(snapshot),
+        (
+            (0.0, 0.0),
+            (50.0, 0.0),
+            (65.0, weight * 0.15),
+            (80.0, weight * 0.3),
+            (90.0, weight * 0.4),
+        ),
+    )
+    return min(weight, call_open_interest_score + call_share_score)
+
+
+def _score_open_interest_change(snapshot: TickerSnapshot, weight: float) -> float:
+    oi_change = _open_interest_change_metrics(snapshot)
+    if not oi_change["has_change"]:
+        return 0.0
+
+    call_change = oi_change["call_change"]
+    net_change = oi_change["net_change"]
+    call_change_pct = oi_change["call_change_pct"]
+    if call_change is None or call_change <= 0:
+        return 0.0
+
+    pct_score = _piecewise_score(
+        call_change_pct,
+        (
+            (0.0, 0.0),
+            (2.0, weight * 0.3),
+            (5.0, weight * 0.6),
+            (10.0, weight * 0.85),
+            (20.0, weight),
+        ),
+    )
+    absolute_score = _piecewise_score(
+        call_change,
+        (
+            (0.0, 0.0),
+            (100.0, weight * 0.2),
+            (1_000.0, weight * 0.5),
+            (5_000.0, weight * 0.8),
+            (20_000.0, weight),
+        ),
+    )
+    net_bonus = weight * 0.1 if net_change is not None and net_change > 0 else 0.0
+    return min(weight, max(pct_score, absolute_score) + net_bonus)
 
 
 def _score_options_activity(snapshot: TickerSnapshot, weight: float) -> float:
@@ -666,6 +944,80 @@ def _risk_flags(
             )
         )
 
+    if snapshot.dilution_risk is True:
+        flags.append(
+            _guardrail_flag(
+                "dilution_risk",
+                "high",
+                "Premium corporate-action or filing data indicates possible dilution risk.",
+                field="dilution_risk",
+            )
+        )
+    if snapshot.offering_risk is True:
+        flags.append(
+            _guardrail_flag(
+                "offering_risk",
+                "high",
+                "Premium filing or news data indicates offering risk.",
+                field="offering_risk",
+            )
+        )
+    if snapshot.warrant_overhang_risk is True:
+        flags.append(
+            _guardrail_flag(
+                "warrant_overhang_risk",
+                "warning",
+                "Premium filing data indicates warrant-overhang risk.",
+                field="warrant_overhang_risk",
+            )
+        )
+    if snapshot.atm_program_risk is True:
+        flags.append(
+            _guardrail_flag(
+                "atm_program_risk",
+                "warning",
+                "Premium filing data indicates an ATM-program risk signal.",
+                field="atm_program_risk",
+            )
+        )
+
+    if snapshot.active_trading_halt is True:
+        flags.append(
+            _guardrail_flag(
+                "active_trading_halt",
+                "high",
+                "Event feed indicates an active trading halt.",
+                field="active_trading_halt",
+            )
+        )
+    elif snapshot.halt_risk is True:
+        flags.append(
+            _guardrail_flag(
+                "halt_risk",
+                "high",
+                "Event feed indicates elevated halt risk.",
+                field="halt_risk",
+            )
+        )
+    if snapshot.event_risk is True:
+        flags.append(
+            _guardrail_flag(
+                "event_risk",
+                "warning",
+                "Event feed indicates an event risk that may affect tradability.",
+                field="event_risk",
+            )
+        )
+    if snapshot.material_news_event is True:
+        flags.append(
+            _guardrail_flag(
+                "material_news_event",
+                "info",
+                "Event feed indicates material recent news.",
+                field="material_news_event",
+            )
+        )
+
     if snapshot.source_warnings:
         flags.append(
             _guardrail_flag(
@@ -828,14 +1180,13 @@ def _gamma_confidence(snapshot: TickerSnapshot) -> tuple[float, list[str]]:
     score = 0.0
     rationales: list[str] = []
     for field_name, weight, label, optional in (
-        ("price", 10.0, "underlying price", False),
-        ("call_volume", 20.0, "call volume", False),
-        ("put_volume", 10.0, "put volume", True),
-        ("call_open_interest", 15.0, "call open interest", False),
+        ("price", 8.0, "underlying price", False),
+        ("call_volume", 15.0, "call volume", False),
+        ("put_volume", 7.0, "put volume", True),
+        ("call_open_interest", 10.0, "call open interest", False),
         ("put_open_interest", 5.0, "put open interest", True),
-        ("dealer_gamma_exposure_proxy", 20.0, "dealer gamma exposure", False),
-        ("market_cap", 10.0, "market cap", True),
-        ("avg_volume_20d", 10.0, "20-day average volume", True),
+        ("market_cap", 8.0, "market cap", True),
+        ("avg_volume_20d", 7.0, "20-day average volume", True),
     ):
         contribution, field_rationales = _confidence_field(
             snapshot,
@@ -847,11 +1198,139 @@ def _gamma_confidence(snapshot: TickerSnapshot) -> tuple[float, list[str]]:
         score += contribution
         rationales.extend(field_rationales)
 
-    if snapshot.dealer_gamma_exposure_proxy is not None and _field_status(snapshot, "dealer_gamma_exposure_proxy") == "estimated":
-        rationales.append("Gamma exposure is a public-data proxy rather than true dealer positioning.")
+    if _has_provider_backed_true_gamma(snapshot):
+        contribution, field_rationales = _true_gamma_confidence(snapshot, 30.0)
+        score += contribution
+        rationales.extend(field_rationales)
+        detail_contribution, detail_rationales = _gamma_detail_confidence(snapshot, 10.0)
+        score += detail_contribution
+        rationales.extend(detail_rationales)
+        rationales.append("Provider-backed greeks support true GEX confidence.")
+    elif snapshot.dealer_gamma_exposure_proxy is not None:
+        contribution, field_rationales = _confidence_field(
+            snapshot,
+            "dealer_gamma_exposure_proxy",
+            18.0,
+            "public gamma exposure proxy",
+        )
+        score += contribution
+        rationales.extend(field_rationales)
+        score += _proxy_gamma_support_confidence(snapshot, 7.0)
+        rationales.append("Gamma exposure is a public-data proxy, not provider-backed true GEX.")
+    else:
+        rationales.append("gamma exposure missing; data gap reduces confidence")
+
+    option_freshness_penalty, option_freshness_rationale = _option_chain_freshness_penalty(snapshot)
+    score -= option_freshness_penalty
+    if option_freshness_rationale is not None:
+        rationales.append(option_freshness_rationale)
+
     if not rationales:
         rationales.append("Options volume, open-interest, exposure, and liquidity fields are available.")
     return round(min(100.0, score), 1), rationales
+
+
+def _true_gamma_confidence(snapshot: TickerSnapshot, weight: float) -> tuple[float, list[str]]:
+    fields = [
+        field_name
+        for field_name in (
+            "absolute_gamma_exposure",
+            "gamma_exposure_pct_market_cap",
+            "net_gamma_exposure",
+            "call_gamma_exposure",
+            "put_gamma_exposure",
+        )
+        if getattr(snapshot, field_name) is not None
+    ]
+    if not fields:
+        return 0.0, ["true gamma exposure missing; data gap reduces confidence"]
+
+    multipliers = [_field_quality_multiplier(_field_status(snapshot, field_name)) for field_name in fields]
+    quality_multiplier = min(multipliers) if multipliers else 0.0
+    rationales: list[str] = []
+    if quality_multiplier < 1.0:
+        rationales.append("One or more true gamma fields are estimated, stale, or incomplete.")
+
+    source = _gamma_source_name(snapshot)
+    source_quality = snapshot.source_quality.get(source) if source else None
+    source_multiplier = 1.0
+    if source_quality is not None and source_quality < 75:
+        source_multiplier = 0.8 if source_quality < 50 else 0.92
+        rationales.append(f"True gamma source quality is {source_quality:.0f}/100.")
+
+    capabilities = _option_chain_capabilities(snapshot)
+    if capabilities.get("gamma") is True and capabilities.get("open_interest") is True:
+        rationales.append("Option-chain provider supplies greeks and open interest.")
+    elif capabilities:
+        rationales.append("Option-chain provider capabilities are partial for true GEX.")
+
+    return weight * quality_multiplier * source_multiplier, rationales
+
+
+def _gamma_detail_confidence(snapshot: TickerSnapshot, weight: float) -> tuple[float, list[str]]:
+    score = 0.0
+    rationales: list[str] = []
+
+    if snapshot.gamma_flip_distance_pct is not None:
+        score += weight * 0.25
+    else:
+        rationales.append("gamma flip distance missing; expiry-aware confidence is lower")
+
+    if snapshot.call_wall_strike is not None or snapshot.put_wall_strike is not None:
+        score += weight * 0.2
+    else:
+        rationales.append("call/put wall strikes missing; wall confidence is lower")
+
+    if _gamma_concentration_pct(snapshot) is not None:
+        score += weight * 0.2
+    else:
+        rationales.append("gamma strike/expiry concentration missing; concentration confidence is lower")
+
+    if _near_gamma_metrics(snapshot)["exposure"] is not None:
+        score += weight * 0.15
+    else:
+        rationales.append("near-expiration true GEX unavailable; near-term confidence is lower")
+
+    oi_change = _open_interest_change_metrics(snapshot)
+    if oi_change["has_change"]:
+        score += weight * 0.2
+    else:
+        rationales.append("open-interest change missing; OI-build confidence is lower")
+
+    return score, rationales
+
+
+def _proxy_gamma_support_confidence(snapshot: TickerSnapshot, weight: float) -> float:
+    score = 0.0
+    if snapshot.call_open_interest is not None:
+        score += weight * 0.4
+    if snapshot.put_open_interest is not None:
+        score += weight * 0.2
+    if snapshot.call_volume is not None:
+        score += weight * 0.25
+    if snapshot.put_volume is not None:
+        score += weight * 0.15
+    return min(weight, score)
+
+
+def _option_chain_freshness_penalty(snapshot: TickerSnapshot) -> tuple[float, str | None]:
+    if snapshot.option_chain_freshness_seconds is not None and snapshot.option_chain_stale_after_seconds is not None:
+        if snapshot.option_chain_freshness_seconds > snapshot.option_chain_stale_after_seconds:
+            return 8.0, "Option-chain data is stale for gamma scoring."
+        if snapshot.option_chain_freshness_seconds > snapshot.option_chain_stale_after_seconds * 0.75:
+            return 3.0, "Option-chain data is approaching its stale threshold."
+        return 0.0, None
+
+    if snapshot.option_chain_fetched_at:
+        fetched_at = _parse_source_datetime(snapshot.option_chain_fetched_at)
+        if fetched_at is None:
+            return 3.0, "Option-chain timestamp could not be parsed."
+        age_hours = max(0.0, (datetime.now(timezone.utc) - fetched_at).total_seconds() / 3600.0)
+        if age_hours > 24:
+            return 8.0, f"Option-chain data is stale ({age_hours:.1f} hours old)."
+        if age_hours > 6:
+            return 3.0, f"Option-chain data is older than 6 hours ({age_hours:.1f} hours old)."
+    return 0.0, None
 
 
 def _float_or_market_cap_confidence(
@@ -1049,7 +1528,7 @@ def _signal_rationale(snapshot: TickerSnapshot, key: str) -> str:
 
     if key == "borrow_fee":
         if snapshot.borrow_fee_pct is None:
-            return "borrow fee unavailable from current Yahoo data"
+            return "borrow fee unavailable from current providers"
         return f"{snapshot.borrow_fee_pct:.1f}% annualized borrow fee"
 
     if key == "days_to_cover":
@@ -1092,11 +1571,86 @@ def _signal_rationale(snapshot: TickerSnapshot, key: str) -> str:
         return f"{_format_large_number(snapshot.call_volume)} call volume{ratio_text}"
 
     if key == "dealer_gamma_exposure":
+        if _has_provider_backed_true_gamma(snapshot):
+            true_exposure = _true_gamma_exposure_value(snapshot)
+            pct_market_cap = _gamma_exposure_pct_market_cap(snapshot)
+            pct_text = f" ({pct_market_cap:.1f}% of market cap)" if pct_market_cap is not None else ""
+            value_text = _format_large_number(true_exposure) if true_exposure is not None else "provider-backed"
+            near = _near_gamma_metrics(snapshot)
+            near_text = (
+                f"; near-expiration GEX {_format_large_number(near['exposure'])}"
+                if near["exposure"] is not None
+                else ""
+            )
+            return f"{value_text} provider-backed true gamma exposure{pct_text}{near_text}"
         if snapshot.dealer_gamma_exposure_proxy is None:
-            return "dealer gamma exposure proxy unavailable"
+            return "true GEX and dealer gamma exposure proxy unavailable"
         pct_market_cap = _dealer_gamma_pct_market_cap(snapshot)
         pct_text = f" ({pct_market_cap:.1f}% of market cap)" if pct_market_cap is not None else ""
-        return f"{_format_large_number(snapshot.dealer_gamma_exposure_proxy)} public-options exposure proxy{pct_text}"
+        return f"{_format_large_number(snapshot.dealer_gamma_exposure_proxy)} public-options exposure proxy{pct_text}; not true GEX"
+
+    if key == "gamma_flip_proximity":
+        if not _has_provider_backed_true_gamma(snapshot):
+            return "gamma flip requires provider-backed true greeks; proxy data gets no flip credit"
+        if snapshot.gamma_flip_distance_pct is None:
+            return "gamma flip distance unavailable from true-greeks provider"
+        price_text = f" at ${snapshot.gamma_flip_price:.2f}" if snapshot.gamma_flip_price is not None else ""
+        return f"gamma flip{price_text} is {abs(snapshot.gamma_flip_distance_pct):.1f}% from spot"
+
+    if key == "call_put_gamma_skew":
+        if _has_provider_backed_true_gamma(snapshot):
+            call_share = _call_gamma_share_pct(snapshot)
+            if call_share is None:
+                return "call/put true gamma skew unavailable"
+            net = _format_large_number(snapshot.net_gamma_exposure)
+            return f"{call_share:.1f}% of true gamma exposure is call-side; net GEX {net}"
+        call_share = _call_open_interest_share_pct(snapshot)
+        if call_share is None:
+            return "call/put gamma skew unavailable; proxy open-interest fallback missing"
+        return f"{call_share:.1f}% of proxy option open interest is call-side"
+
+    if key == "gamma_concentration_walls":
+        if _has_provider_backed_true_gamma(snapshot):
+            details: list[str] = []
+            if snapshot.call_wall_strike is not None:
+                details.append(
+                    f"call wall ${snapshot.call_wall_strike:.2f}{_distance_text(_distance_pct(snapshot.call_wall_strike, snapshot.price))}"
+                )
+            if snapshot.put_wall_strike is not None:
+                details.append(
+                    f"put wall ${snapshot.put_wall_strike:.2f}{_distance_text(_distance_pct(snapshot.put_wall_strike, snapshot.price))}"
+                )
+            if snapshot.max_gamma_strike is not None:
+                details.append(
+                    f"largest gamma strike ${snapshot.max_gamma_strike:.2f}{_distance_text(_distance_pct(snapshot.max_gamma_strike, snapshot.price))}"
+                )
+            if snapshot.largest_gamma_expiration is not None:
+                dte = _largest_gamma_expiration_dte(snapshot)
+                dte_text = f" ({dte:.0f} DTE)" if dte is not None else ""
+                details.append(f"largest expiry {snapshot.largest_gamma_expiration}{dte_text}")
+            concentration = _gamma_concentration_pct(snapshot)
+            if concentration is not None:
+                details.append(f"{concentration:.1f}% max strike/expiry concentration")
+            return "; ".join(details) if details else "gamma walls and concentration unavailable"
+        if snapshot.call_open_interest is None:
+            return "gamma walls unavailable; using no proxy concentration fallback"
+        call_share = _call_open_interest_share_pct(snapshot)
+        share_text = f", {call_share:.1f}% call OI share" if call_share is not None else ""
+        return f"proxy fallback uses {_format_large_number(snapshot.call_open_interest)} call open interest{share_text}"
+
+    if key == "open_interest_change":
+        oi_change = _open_interest_change_metrics(snapshot)
+        if not oi_change["has_change"]:
+            return "open-interest change unavailable from current option source"
+        call_change = _format_signed_number(oi_change["call_change"])
+        put_change = _format_signed_number(oi_change["put_change"])
+        net_change = _format_signed_number(oi_change["net_change"])
+        pct_text = (
+            f" ({oi_change['call_change_pct']:.1f}% of call OI)"
+            if oi_change["call_change_pct"] is not None
+            else ""
+        )
+        return f"call OI change {call_change}{pct_text}; put OI change {put_change}; net call-minus-put {net_change}"
 
     if key == "options_activity":
         if snapshot.call_volume is None and snapshot.call_open_interest is None:
@@ -1171,8 +1725,467 @@ def _dealer_gamma_pct_market_cap(snapshot: TickerSnapshot) -> float | None:
     return snapshot.dealer_gamma_exposure_proxy / snapshot.market_cap * 100.0
 
 
-def _round_metric(value: float | bool | None) -> float | bool | None:
+def _gamma_detail_metrics(snapshot: TickerSnapshot) -> dict[str, Any]:
+    near_gamma = _near_gamma_metrics(snapshot)
+    oi_change = _open_interest_change_metrics(snapshot)
+    return {
+        "gamma_exposure_source_type": _gamma_exposure_source_type(snapshot),
+        "gamma_exposure_source": _gamma_source_name(snapshot),
+        "gamma_exposure_is_true": _has_provider_backed_true_gamma(snapshot),
+        "gamma_exposure_is_proxy": _uses_proxy_gamma(snapshot),
+        "near_gamma_exposure": near_gamma["exposure"],
+        "near_gamma_exposure_pct_market_cap": near_gamma["pct_market_cap"],
+        "near_gamma_contract_count": near_gamma["contract_count"],
+        "near_gamma_max_days_to_expiration": near_gamma["max_days_to_expiration"],
+        "call_put_gamma_skew_pct": _call_put_gamma_skew_pct(snapshot),
+        "call_gamma_share_pct": _call_gamma_share_pct(snapshot),
+        "call_open_interest_share_pct": _call_open_interest_share_pct(snapshot),
+        "call_wall_distance_pct": _distance_pct(snapshot.call_wall_strike, snapshot.price),
+        "put_wall_distance_pct": _distance_pct(snapshot.put_wall_strike, snapshot.price),
+        "max_gamma_strike_distance_pct": _distance_pct(snapshot.max_gamma_strike, snapshot.price),
+        "largest_gamma_expiration_days_to_expiration": _largest_gamma_expiration_dte(snapshot),
+        "call_open_interest_change": oi_change["call_change"],
+        "put_open_interest_change": oi_change["put_change"],
+        "net_open_interest_change": oi_change["net_change"],
+        "call_open_interest_change_pct": oi_change["call_change_pct"],
+        "option_open_interest_change_contract_count": oi_change["contract_count"],
+    }
+
+
+def _gamma_exposure_pct_market_cap(snapshot: TickerSnapshot) -> float | None:
+    if not _has_provider_backed_true_gamma(snapshot):
+        return None
+    if snapshot.gamma_exposure_pct_market_cap is not None:
+        return snapshot.gamma_exposure_pct_market_cap
+    exposure_value = _true_gamma_exposure_value(snapshot)
+    if exposure_value is None or snapshot.market_cap is None or snapshot.market_cap <= 0:
+        return None
+    return exposure_value / snapshot.market_cap * 100.0
+
+
+def _true_gamma_exposure_value(snapshot: TickerSnapshot) -> float | None:
+    if snapshot.absolute_gamma_exposure is not None:
+        return abs(snapshot.absolute_gamma_exposure)
+    if snapshot.net_gamma_exposure is not None:
+        return abs(snapshot.net_gamma_exposure)
+    exposures = [
+        abs(value)
+        for value in (snapshot.call_gamma_exposure, snapshot.put_gamma_exposure)
+        if value is not None
+    ]
+    if exposures:
+        return sum(exposures)
+    return None
+
+
+def _has_true_gamma_exposure(snapshot: TickerSnapshot) -> bool:
+    return _has_provider_backed_true_gamma(snapshot)
+
+
+def _has_provider_backed_true_gamma(snapshot: TickerSnapshot) -> bool:
+    has_true_value = (
+        _true_gamma_exposure_value(snapshot) is not None
+        or snapshot.gamma_exposure_pct_market_cap is not None
+    )
+    if not has_true_value:
+        return False
+    capabilities = _option_chain_capabilities(snapshot)
+    if _is_yahoo_proxy_source(snapshot) and capabilities.get("true_gamma_exposure") is not True:
+        return False
+    return True
+
+
+def _uses_proxy_gamma(snapshot: TickerSnapshot) -> bool:
+    return not _has_provider_backed_true_gamma(snapshot) and snapshot.dealer_gamma_exposure_proxy is not None
+
+
+def _gamma_exposure_source_type(snapshot: TickerSnapshot) -> str:
+    if _has_provider_backed_true_gamma(snapshot):
+        return "true_greeks"
+    if snapshot.dealer_gamma_exposure_proxy is not None:
+        return "proxy"
+    return "missing"
+
+
+def _option_chain_capabilities(snapshot: TickerSnapshot) -> dict[str, bool]:
+    if not isinstance(snapshot.option_chain_capabilities, dict):
+        return {}
+    return {str(key): bool(value) for key, value in snapshot.option_chain_capabilities.items()}
+
+
+def _is_yahoo_proxy_source(snapshot: TickerSnapshot) -> bool:
+    return snapshot.option_chain_source == YAHOO_OPTION_PROXY_SOURCE
+
+
+def _scoring_gamma_exposure_value(snapshot: TickerSnapshot) -> float | None:
+    if _has_provider_backed_true_gamma(snapshot):
+        return _true_gamma_exposure_value(snapshot)
+    return snapshot.dealer_gamma_exposure_proxy
+
+
+def _scoring_gamma_exposure_pct_market_cap(snapshot: TickerSnapshot) -> float | None:
+    if _has_provider_backed_true_gamma(snapshot):
+        return _gamma_exposure_pct_market_cap(snapshot)
+    return _dealer_gamma_pct_market_cap(snapshot)
+
+
+def _near_gamma_metrics(
+    snapshot: TickerSnapshot,
+    max_days_to_expiration: float = 14.0,
+) -> dict[str, float | int | None]:
+    result: dict[str, float | int | None] = {
+        "exposure": None,
+        "pct_market_cap": None,
+        "contract_count": 0,
+        "max_days_to_expiration": None,
+    }
+    if not _has_provider_backed_true_gamma(snapshot) or snapshot.price is None or snapshot.price <= 0:
+        return result
+
+    exposure = 0.0
+    contract_count = 0
+    max_dte: float | None = None
+    for record in _option_chain_records(snapshot):
+        dte = _record_days_to_expiration(record)
+        if dte is None or dte < 0 or dte > max_days_to_expiration:
+            continue
+        gamma = _record_float(record, "gamma")
+        open_interest = _record_float(record, "open_interest")
+        if gamma is None or open_interest is None or open_interest < 0:
+            continue
+        exposure += (
+            abs(gamma)
+            * open_interest
+            * CONTRACT_MULTIPLIER
+            * snapshot.price
+            * snapshot.price
+            * GAMMA_EXPOSURE_PERCENT_MOVE
+        )
+        contract_count += 1
+        max_dte = dte if max_dte is None else max(max_dte, dte)
+
+    if contract_count == 0:
+        return result
+    result["exposure"] = exposure
+    result["pct_market_cap"] = (
+        exposure / snapshot.market_cap * 100.0
+        if snapshot.market_cap and snapshot.market_cap > 0
+        else None
+    )
+    result["contract_count"] = contract_count
+    result["max_days_to_expiration"] = max_dte
+    return result
+
+
+def _open_interest_change_metrics(
+    snapshot: TickerSnapshot,
+) -> dict[str, float | int | bool | None]:
+    call_change = 0.0
+    put_change = 0.0
+    contract_count = 0
+    for record in _option_chain_records(snapshot):
+        change = _record_float(record, "open_interest_change")
+        if change is None:
+            continue
+        side = _record_text(record, "side")
+        if side == "call":
+            call_change += change
+        elif side == "put":
+            put_change += change
+        else:
+            continue
+        contract_count += 1
+
+    if contract_count == 0:
+        return {
+            "has_change": False,
+            "call_change": None,
+            "put_change": None,
+            "net_change": None,
+            "call_change_pct": None,
+            "contract_count": 0,
+        }
+
+    call_open_interest = _call_open_interest_total(snapshot)
+    call_change_pct = (
+        call_change / call_open_interest * 100.0
+        if call_open_interest and call_open_interest > 0
+        else None
+    )
+    return {
+        "has_change": True,
+        "call_change": call_change,
+        "put_change": put_change,
+        "net_change": call_change - put_change,
+        "call_change_pct": call_change_pct,
+        "contract_count": contract_count,
+    }
+
+
+def _call_gamma_share_pct(snapshot: TickerSnapshot) -> float | None:
+    if not _has_provider_backed_true_gamma(snapshot):
+        return None
+    call_exposure = abs(snapshot.call_gamma_exposure) if snapshot.call_gamma_exposure is not None else None
+    put_exposure = abs(snapshot.put_gamma_exposure) if snapshot.put_gamma_exposure is not None else None
+    if call_exposure is None and put_exposure is None:
+        return None
+    call_exposure = call_exposure or 0.0
+    put_exposure = put_exposure or 0.0
+    total = call_exposure + put_exposure
+    if total <= 0:
+        return None
+    return call_exposure / total * 100.0
+
+
+def _call_put_gamma_skew_pct(snapshot: TickerSnapshot) -> float | None:
+    if not _has_provider_backed_true_gamma(snapshot):
+        return None
+    exposure = _true_gamma_exposure_value(snapshot)
+    if exposure is None or exposure <= 0:
+        return None
+    if snapshot.net_gamma_exposure is not None:
+        return snapshot.net_gamma_exposure / exposure * 100.0
+    call_share = _call_gamma_share_pct(snapshot)
+    return (call_share - 50.0) * 2.0 if call_share is not None else None
+
+
+def _call_open_interest_share_pct(snapshot: TickerSnapshot) -> float | None:
+    call_open_interest = _call_open_interest_total(snapshot)
+    put_open_interest = _put_open_interest_total(snapshot)
+    if call_open_interest is None or put_open_interest is None:
+        return None
+    total = call_open_interest + put_open_interest
+    if total <= 0:
+        return None
+    return call_open_interest / total * 100.0
+
+
+def _call_open_interest_total(snapshot: TickerSnapshot) -> float | None:
+    if snapshot.call_open_interest is not None:
+        return snapshot.call_open_interest
+    total = 0.0
+    found = False
+    for record in _option_chain_records(snapshot):
+        if _record_text(record, "side") != "call":
+            continue
+        open_interest = _record_float(record, "open_interest")
+        if open_interest is None:
+            continue
+        total += open_interest
+        found = True
+    return total if found else None
+
+
+def _put_open_interest_total(snapshot: TickerSnapshot) -> float | None:
+    if snapshot.put_open_interest is not None:
+        return snapshot.put_open_interest
+    total = 0.0
+    found = False
+    for record in _option_chain_records(snapshot):
+        if _record_text(record, "side") != "put":
+            continue
+        open_interest = _record_float(record, "open_interest")
+        if open_interest is None:
+            continue
+        total += open_interest
+        found = True
+    return total if found else None
+
+
+def _gamma_concentration_pct(snapshot: TickerSnapshot) -> float | None:
+    values = [
+        value
+        for value in (
+            snapshot.gamma_strike_concentration_pct,
+            snapshot.gamma_expiration_concentration_pct,
+        )
+        if value is not None
+    ]
+    return max(values) if values else None
+
+
+def _distance_pct(strike: float | None, price: float | None) -> float | None:
+    if strike is None or price is None or price <= 0:
+        return None
+    return ((strike / price) - 1.0) * 100.0
+
+
+def _distance_text(distance_pct: float | None) -> str:
+    if distance_pct is None:
+        return ""
+    direction = "above" if distance_pct >= 0 else "below"
+    return f" ({abs(distance_pct):.1f}% {direction} spot)"
+
+
+def _score_call_wall_distance(distance_pct: float | None, weight: float) -> float:
+    if distance_pct is None:
+        return 0.0
+    absolute_distance = abs(distance_pct)
+    if distance_pct >= 0:
+        return _piecewise_score(
+            absolute_distance,
+            (
+                (0.0, weight),
+                (5.0, weight),
+                (15.0, weight * 0.65),
+                (30.0, weight * 0.25),
+                (60.0, 0.0),
+            ),
+        )
+    return _piecewise_score(
+        absolute_distance,
+        (
+            (0.0, weight * 0.35),
+            (5.0, weight * 0.25),
+            (15.0, weight * 0.1),
+            (30.0, 0.0),
+        ),
+    )
+
+
+def _score_put_wall_distance(distance_pct: float | None, weight: float) -> float:
+    if distance_pct is None:
+        return 0.0
+    absolute_distance = abs(distance_pct)
+    if distance_pct <= 0:
+        return _piecewise_score(
+            absolute_distance,
+            (
+                (0.0, weight),
+                (5.0, weight),
+                (15.0, weight * 0.5),
+                (30.0, 0.0),
+            ),
+        )
+    return _piecewise_score(
+        absolute_distance,
+        (
+            (0.0, weight * 0.25),
+            (5.0, weight * 0.15),
+            (15.0, 0.0),
+        ),
+    )
+
+
+def _score_near_strike_distance(distance_pct: float | None, weight: float) -> float:
+    if distance_pct is None:
+        return 0.0
+    return _piecewise_score(
+        abs(distance_pct),
+        (
+            (0.0, weight),
+            (3.0, weight),
+            (10.0, weight * 0.5),
+            (20.0, 0.0),
+        ),
+    )
+
+
+def _score_near_gamma_expiration(snapshot: TickerSnapshot, weight: float) -> float:
+    dte = _largest_gamma_expiration_dte(snapshot)
+    if dte is None or dte < 0:
+        return 0.0
+    return _piecewise_score(
+        dte,
+        (
+            (0.0, weight),
+            (7.0, weight),
+            (14.0, weight * 0.6),
+            (30.0, weight * 0.25),
+            (60.0, 0.0),
+        ),
+    )
+
+
+def _largest_gamma_expiration_dte(snapshot: TickerSnapshot) -> float | None:
+    expiration = snapshot.largest_gamma_expiration
+    if not expiration:
+        return None
+
+    matching_dtes = [
+        dte
+        for record in _option_chain_records(snapshot)
+        if _record_text(record, "expiration") == expiration
+        for dte in [_record_days_to_expiration(record)]
+        if dte is not None
+    ]
+    if matching_dtes:
+        return min(matching_dtes)
+    return _days_until_expiration(expiration)
+
+
+def _record_days_to_expiration(record: Any) -> float | None:
+    dte = _record_float(record, "days_to_expiration")
+    if dte is None:
+        dte = _record_float(record, "days_to_expiry")
+    if dte is not None:
+        return dte
+    expiration = _record_text(record, "expiration")
+    return _days_until_expiration(expiration)
+
+
+def _days_until_expiration(expiration: str | None) -> float | None:
+    if not expiration:
+        return None
+    try:
+        expiration_date = datetime.fromisoformat(
+            str(expiration).replace("Z", "+00:00").split("T", 1)[0]
+        ).date()
+    except ValueError:
+        return None
+    return float((expiration_date - datetime.now(timezone.utc).date()).days)
+
+
+def _option_chain_records(snapshot: TickerSnapshot) -> list[Any]:
+    return snapshot.option_chain_records if isinstance(snapshot.option_chain_records, list) else []
+
+
+def _record_float(record: Any, field_name: str) -> float | None:
+    value = _record_value(record, field_name)
     if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number
+
+
+def _record_text(record: Any, field_name: str) -> str | None:
+    value = _record_value(record, field_name)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text.lower() if field_name == "side" else text
+
+
+def _record_value(record: Any, field_name: str) -> Any:
+    if isinstance(record, dict):
+        return record.get(field_name)
+    return getattr(record, field_name, None)
+
+
+def _gamma_source_name(snapshot: TickerSnapshot) -> str | None:
+    if _has_provider_backed_true_gamma(snapshot):
+        return (
+            snapshot.option_chain_source
+            or snapshot.option_chain_provider
+            or snapshot.field_sources.get("absolute_gamma_exposure")
+            or snapshot.field_sources.get("net_gamma_exposure")
+            or "provider_option_chain"
+        )
+    if snapshot.dealer_gamma_exposure_proxy is not None:
+        return (
+            snapshot.field_sources.get("dealer_gamma_exposure_proxy")
+            or snapshot.option_chain_source
+            or snapshot.option_chain_provider
+            or "public_options_proxy"
+        )
+    return None
+
+
+def _round_metric(value: Any) -> Any:
+    if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
         return value
     return round(value, 2)
 
@@ -1188,6 +2201,13 @@ def _format_large_number(value: float | None) -> str:
     if abs_value >= 1_000:
         return f"{value / 1_000:.1f}K"
     return f"{value:.0f}"
+
+
+def _format_signed_number(value: float | None) -> str:
+    if value is None:
+        return "N/A"
+    prefix = "+" if value > 0 else ""
+    return f"{prefix}{_format_large_number(value)}"
 
 
 def _piecewise_score(value: float | None, curve: Sequence[tuple[float, float]]) -> float:

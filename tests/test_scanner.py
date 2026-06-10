@@ -39,6 +39,14 @@ def test_scoring_models_have_independent_100_point_weights():
         weights = SCORING_MODEL_WEIGHTS[model["key"]]
         assert sum(weights.values()) == 100
         assert weights == {signal["key"]: signal["weight"] for signal in model["signals"]}
+    assert set(SCORING_MODEL_WEIGHTS["gamma_candidate"]) == {
+        "call_buying",
+        "dealer_gamma_exposure",
+        "gamma_flip_proximity",
+        "call_put_gamma_skew",
+        "gamma_concentration_walls",
+        "open_interest_change",
+    }
 
 
 def test_scoring_model_metadata_exposes_model_definitions_from_python_model():
@@ -182,6 +190,28 @@ def test_cached_provider_reuses_raw_data_for_one_hour(tmp_path):
     assert first.price == 1.0
     assert second.price == 1.0
     assert third.price == 2.0
+
+
+def test_cached_provider_status_reports_cache_and_provider_health(tmp_path):
+    class StaticProvider:
+        def fetch(self, symbol):
+            return TickerSnapshot(symbol=symbol, price=10.0)
+
+    now = [1_000.0]
+    cached_provider = CachedMarketDataProvider(StaticProvider(), tmp_path / "market.sqlite3", clock=lambda: now[0])
+
+    empty_status = cached_provider.status()
+    cached_provider.fetch("BYND")
+    filled_status = cached_provider.status()
+
+    assert empty_status["status"] == "ok"
+    assert empty_status["provider"]["last_fetch"]["status"] == "not_requested"
+    assert filled_status["status"] == "ok"
+    assert filled_status["database"]["accessible"] is True
+    assert filled_status["cache"]["total_rows"] == 1
+    assert filled_status["cache"]["fresh_rows"] == 1
+    assert filled_status["provider"]["last_fetch"]["status"] == "ok"
+    assert filled_status["provider"]["last_fetch"]["symbol"] == "BYND"
 
 
 def test_cached_provider_keeps_refreshed_raw_snapshots_in_history(tmp_path):

@@ -55,6 +55,12 @@ class ScoreHistoryStore:
         if existing is not None:
             return ScoreHistoryWrite(row_id=existing, inserted=False)
 
+        metrics = _metrics_with_source_metadata(
+            result.metrics,
+            field_sources=result.field_sources,
+            field_quality=result.field_quality,
+            source_quality=result.source_quality,
+        )
         payload = (
             result.symbol,
             result.company_name,
@@ -71,7 +77,7 @@ class ScoreHistoryStore:
             _to_json(result.model_components),
             _to_json(result.model_rationales),
             _to_json(result.model_confidence),
-            _to_json(result.metrics),
+            _to_json(metrics),
             _to_json(result.risk_flags),
             _to_json(result.warnings),
             created_at_iso,
@@ -546,6 +552,24 @@ def _history_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
 
 def _to_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True)
+
+
+def _metrics_with_source_metadata(
+    metrics: dict[str, Any],
+    *,
+    field_sources: dict[str, str],
+    field_quality: dict[str, str],
+    source_quality: dict[str, float],
+) -> dict[str, Any]:
+    merged = dict(metrics)
+    for key, value in (
+        ("_field_sources", field_sources),
+        ("_field_quality", field_quality),
+        ("_source_quality", source_quality),
+    ):
+        if value and key not in merged:
+            merged[key] = dict(value)
+    return merged
 
 
 def _from_json(value: str, default: Any) -> Any:

@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+from .alert_delivery import AlertDeliveryOutcome, AlertDeliveryService, normalize_delivery_channels
 from .domain import InvalidSymbolError, ScreenerError
 from .service import normalize_symbols
 
@@ -18,6 +19,7 @@ logger = logging.getLogger(__name__)
 VALID_TARGET_TYPES = {"saved_screen", "watchlist", "yahoo_most_shorted", "symbols"}
 MAX_SCHEDULE_SYMBOLS = 250
 DEFAULT_SCHEDULER_POLL_SECONDS = 30
+_UNSET = object()
 
 
 class AutomationError(RuntimeError):
@@ -55,11 +57,13 @@ class AutomationService:
         db_path: str | Path,
         scanner: Any,
         yahoo_screener: Any | None = None,
+        alert_delivery: AlertDeliveryService | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.db_path = Path(db_path)
         self.scanner = scanner
         self.yahoo_screener = yahoo_screener
+        self.alert_delivery = alert_delivery
         self.clock = clock or _utc_now
         self._schema_lock = threading.Lock()
         self._schema_ready = False
@@ -72,12 +76,14 @@ class AutomationService:
         interval_seconds: int,
         enabled: bool = True,
         next_run_at: datetime | str | None = None,
+        owner_id: str | None = None,
     ) -> dict[str, Any]:
         self._ensure_schema()
         name = _require_name(name, "Schedule name is required.")
         target_type = _normalize_target_type(target_type)
         interval_seconds = _validate_interval(interval_seconds)
         target_payload = _normalize_target_payload(target_type, target)
+        normalized_owner_id = _normalize_owner_id(owner_id)
         now = self.clock()
         next_run = _coerce_datetime(next_run_at) if next_run_at is not None else now + timedelta(seconds=interval_seconds)
 
@@ -85,6 +91,7 @@ class AutomationService:
             cursor = connection.execute(
                 """
                 INSERT INTO scheduled_scans (
+                    owner_id,
                     name,
                     target_type,
                     target_json,
@@ -95,9 +102,10 @@ class AutomationService:
                     created_at,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
                 """,
                 (
+                    normalized_owner_id,
                     name,
                     target_type,
                     _json_dumps(target_payload),
@@ -111,24 +119,34 @@ class AutomationService:
             schedule_id = int(cursor.lastrowid)
         return self.get_schedule(schedule_id)
 
-    def list_schedules(self) -> list[dict[str, Any]]:
+    def list_schedules(self, owner_id: str | None = None) -> list[dict[str, Any]]:
         self._ensure_schema()
+        normalized_owner_id = _normalize_owner_id(owner_id)
+        where = "WHERE owner_id = ?" if normalized_owner_id is not None else ""
+        params: tuple[Any, ...] = (normalized_owner_id,) if normalized_owner_id is not None else ()
         with self._connect() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT *
                 FROM scheduled_scans
+                {where}
                 ORDER BY enabled DESC, next_run_at IS NULL, next_run_at ASC, id ASC
-                """
+                """,
+                params,
             ).fetchall()
         return [_schedule_from_row(row) for row in rows]
 
-    def get_schedule(self, schedule_id: int) -> dict[str, Any]:
+    def get_schedule(self, schedule_id: int, owner_id: str | None = None) -> dict[str, Any]:
         self._ensure_schema()
+        normalized_owner_id = _normalize_owner_id(owner_id)
+        owner_clause = "AND owner_id = ?" if normalized_owner_id is not None else ""
+        params: tuple[Any, ...] = (
+            (schedule_id, normalized_owner_id) if normalized_owner_id is not None else (schedule_id,)
+        )
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT * FROM scheduled_scans WHERE id = ?",
-                (schedule_id,),
+                f"SELECT * FROM scheduled_scans WHERE id = ? {owner_clause}",
+                params,
             ).fetchone()
         if row is None:
             raise ScheduleNotFoundError(f"Scheduled scan {schedule_id} was not found.")
@@ -144,6 +162,7 @@ class AutomationService:
         interval_seconds: int | None = None,
         enabled: bool | None = None,
         next_run_at: datetime | str | None = None,
+        owner_id: str | None | object = _UNSET,
     ) -> dict[str, Any]:
         existing = self.get_schedule(schedule_id)
         updated_name = existing["name"] if name is None else _require_name(name, "Schedule name is required.")
@@ -151,6 +170,7 @@ class AutomationService:
         updated_interval = existing["interval_seconds"] if interval_seconds is None else _validate_interval(interval_seconds)
         updated_enabled = existing["enabled"] if enabled is None else bool(enabled)
         updated_target = existing["target"] if target is None else _normalize_target_payload(updated_type, target)
+        updated_owner_id = existing.get("owner_id") if owner_id is _UNSET else _normalize_owner_id(owner_id)
         if target_type is not None and target is None:
             updated_target = _normalize_target_payload(updated_type, existing["target"])
 
@@ -168,7 +188,8 @@ class AutomationService:
             cursor = connection.execute(
                 """
                 UPDATE scheduled_scans
-                SET name = ?,
+                SET owner_id = ?,
+                    name = ?,
                     target_type = ?,
                     target_json = ?,
                     interval_seconds = ?,
@@ -178,6 +199,7 @@ class AutomationService:
                 WHERE id = ?
                 """,
                 (
+                    updated_owner_id,
                     updated_name,
                     updated_type,
                     _json_dumps(updated_target),
@@ -192,10 +214,15 @@ class AutomationService:
                 raise ScheduleNotFoundError(f"Scheduled scan {schedule_id} was not found.")
         return self.get_schedule(schedule_id)
 
-    def delete_schedule(self, schedule_id: int) -> bool:
+    def delete_schedule(self, schedule_id: int, owner_id: str | None = None) -> bool:
         self._ensure_schema()
+        normalized_owner_id = _normalize_owner_id(owner_id)
+        owner_clause = "AND owner_id = ?" if normalized_owner_id is not None else ""
+        params: tuple[Any, ...] = (
+            (schedule_id, normalized_owner_id) if normalized_owner_id is not None else (schedule_id,)
+        )
         with self._connect() as connection:
-            cursor = connection.execute("DELETE FROM scheduled_scans WHERE id = ?", (schedule_id,))
+            cursor = connection.execute(f"DELETE FROM scheduled_scans WHERE id = ? {owner_clause}", params)
         return cursor.rowcount > 0
 
     def run_scheduled_scan(self, schedule_id: int) -> dict[str, Any]:
@@ -221,7 +248,7 @@ class AutomationService:
             results = _coerce_result_list(response.get("results"))
             result_count = _result_count(response, results)
             status = _run_status(result_count, errors)
-            alert_events = self.process_alerts(results, scan_run_id=run_id)
+            alert_events = self.process_alerts(results, scan_run_id=run_id, owner_id=schedule.get("owner_id"))
         except Exception as exc:
             error_message = str(exc)
             errors.append({"symbol": "*", "message": error_message})
@@ -315,37 +342,64 @@ class AutomationService:
             return self._saved_screen_symbols(target)
         raise ScheduleTargetError(f"Unsupported scheduled target type: {target_type}")
 
-    def create_alert(self, name: str, rule: Mapping[str, Any], enabled: bool = True) -> dict[str, Any]:
+    def create_alert(
+        self,
+        name: str,
+        rule: Mapping[str, Any],
+        enabled: bool = True,
+        delivery_channels: Sequence[str] | None = None,
+        owner_id: str | None = None,
+    ) -> dict[str, Any]:
         self._ensure_schema()
         name = _require_name(name, "Alert name is required.")
         normalized_rule = _normalize_alert_rule(rule)
+        normalized_channels = self._normalize_alert_delivery_channels(delivery_channels)
+        normalized_owner_id = _normalize_owner_id(owner_id)
         now = self.clock()
         with self._connect() as connection:
             cursor = connection.execute(
                 """
-                INSERT INTO alerts (name, rule_json, enabled, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO alerts (owner_id, name, rule_json, enabled, delivery_channels_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (name, _json_dumps(normalized_rule), int(enabled), _datetime_to_json(now), _datetime_to_json(now)),
+                (
+                    normalized_owner_id,
+                    name,
+                    _json_dumps(normalized_rule),
+                    int(enabled),
+                    _json_dumps(normalized_channels),
+                    _datetime_to_json(now),
+                    _datetime_to_json(now),
+                ),
             )
             alert_id = int(cursor.lastrowid)
         return self.get_alert(alert_id)
 
-    def list_alerts(self, enabled_only: bool = False) -> list[dict[str, Any]]:
+    def list_alerts(self, enabled_only: bool = False, owner_id: str | None = None) -> list[dict[str, Any]]:
         self._ensure_schema()
+        normalized_owner_id = _normalize_owner_id(owner_id)
         sql = "SELECT * FROM alerts"
-        params: tuple[Any, ...] = ()
+        clauses: list[str] = []
+        params: list[Any] = []
         if enabled_only:
-            sql += " WHERE enabled = 1"
+            clauses.append("enabled = 1")
+        if normalized_owner_id is not None:
+            clauses.append("owner_id = ?")
+            params.append(normalized_owner_id)
+        if clauses:
+            sql += f" WHERE {' AND '.join(clauses)}"
         sql += " ORDER BY enabled DESC, name ASC, id ASC"
         with self._connect() as connection:
-            rows = connection.execute(sql, params).fetchall()
+            rows = connection.execute(sql, tuple(params)).fetchall()
         return [_alert_from_row(row) for row in rows]
 
-    def get_alert(self, alert_id: int) -> dict[str, Any]:
+    def get_alert(self, alert_id: int, owner_id: str | None = None) -> dict[str, Any]:
         self._ensure_schema()
+        normalized_owner_id = _normalize_owner_id(owner_id)
+        owner_clause = "AND owner_id = ?" if normalized_owner_id is not None else ""
+        params: tuple[Any, ...] = (alert_id, normalized_owner_id) if normalized_owner_id is not None else (alert_id,)
         with self._connect() as connection:
-            row = connection.execute("SELECT * FROM alerts WHERE id = ?", (alert_id,)).fetchone()
+            row = connection.execute(f"SELECT * FROM alerts WHERE id = ? {owner_clause}", params).fetchone()
         if row is None:
             raise AlertNotFoundError(f"Alert {alert_id} was not found.")
         return _alert_from_row(row)
@@ -357,23 +411,33 @@ class AutomationService:
         name: str | None = None,
         rule: Mapping[str, Any] | None = None,
         enabled: bool | None = None,
+        delivery_channels: Sequence[str] | None = None,
+        owner_id: str | None | object = _UNSET,
     ) -> dict[str, Any]:
         existing = self.get_alert(alert_id)
         updated_name = existing["name"] if name is None else _require_name(name, "Alert name is required.")
         updated_rule = existing["rule"] if rule is None else _normalize_alert_rule(rule)
         updated_enabled = existing["enabled"] if enabled is None else bool(enabled)
+        updated_owner_id = existing.get("owner_id") if owner_id is _UNSET else _normalize_owner_id(owner_id)
+        updated_channels = (
+            existing["delivery_channels"]
+            if delivery_channels is None
+            else normalize_delivery_channels(delivery_channels)
+        )
         now = self.clock()
         with self._connect() as connection:
             cursor = connection.execute(
                 """
                 UPDATE alerts
-                SET name = ?, rule_json = ?, enabled = ?, updated_at = ?
+                SET owner_id = ?, name = ?, rule_json = ?, enabled = ?, delivery_channels_json = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
+                    updated_owner_id,
                     updated_name,
                     _json_dumps(updated_rule),
                     int(updated_enabled),
+                    _json_dumps(updated_channels),
                     _datetime_to_json(now),
                     alert_id,
                 ),
@@ -382,19 +446,23 @@ class AutomationService:
                 raise AlertNotFoundError(f"Alert {alert_id} was not found.")
         return self.get_alert(alert_id)
 
-    def delete_alert(self, alert_id: int) -> bool:
+    def delete_alert(self, alert_id: int, owner_id: str | None = None) -> bool:
         self._ensure_schema()
+        normalized_owner_id = _normalize_owner_id(owner_id)
+        owner_clause = "AND owner_id = ?" if normalized_owner_id is not None else ""
+        params: tuple[Any, ...] = (alert_id, normalized_owner_id) if normalized_owner_id is not None else (alert_id,)
         with self._connect() as connection:
-            cursor = connection.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
+            cursor = connection.execute(f"DELETE FROM alerts WHERE id = ? {owner_clause}", params)
         return cursor.rowcount > 0
 
     def process_alerts(
         self,
         results: Sequence[Mapping[str, Any]],
         scan_run_id: int | None = None,
+        owner_id: str | None = None,
     ) -> list[dict[str, Any]]:
         self._ensure_schema()
-        alerts = self.list_alerts(enabled_only=True)
+        alerts = self.list_alerts(enabled_only=True, owner_id=owner_id)
         new_events: list[dict[str, Any]] = []
 
         for result in results:
@@ -420,13 +488,18 @@ class AutomationService:
         symbol: str | None = None,
         active_only: bool = False,
         limit: int = 100,
+        owner_id: str | None = None,
     ) -> list[dict[str, Any]]:
         self._ensure_schema()
+        normalized_owner_id = _normalize_owner_id(owner_id)
         clauses: list[str] = []
         params: list[Any] = []
         if alert_id is not None:
             clauses.append("alert_id = ?")
             params.append(alert_id)
+        if normalized_owner_id is not None:
+            clauses.append("alert_id IN (SELECT id FROM alerts WHERE owner_id = ?)")
+            params.append(normalized_owner_id)
         if symbol:
             clauses.append("symbol = ?")
             params.append(symbol.strip().upper())
@@ -445,7 +518,9 @@ class AutomationService:
                 """,
                 tuple(params),
             ).fetchall()
-        return [_event_from_row(row) for row in rows]
+        events = [_event_from_row(row) for row in rows]
+        self._attach_delivery_attempts(events)
+        return events
 
     def acknowledge_alert_event(self, event_id: int) -> dict[str, Any]:
         self._ensure_schema()
@@ -463,6 +538,143 @@ class AutomationService:
                 raise AlertNotFoundError(f"Alert event {event_id} was not found.")
         return self._get_alert_event(event_id)
 
+    def list_alert_delivery_attempts(
+        self,
+        alert_event_id: int | None = None,
+        alert_id: int | None = None,
+        status: str | None = None,
+        limit: int = 100,
+        owner_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        self._ensure_schema()
+        normalized_owner_id = _normalize_owner_id(owner_id)
+        clauses: list[str] = []
+        params: list[Any] = []
+        if alert_event_id is not None:
+            clauses.append("alert_event_id = ?")
+            params.append(alert_event_id)
+        if alert_id is not None:
+            clauses.append("alert_id = ?")
+            params.append(alert_id)
+        if normalized_owner_id is not None:
+            clauses.append("alert_id IN (SELECT id FROM alerts WHERE owner_id = ?)")
+            params.append(normalized_owner_id)
+        if status:
+            clauses.append("status = ?")
+            params.append(status.strip().lower())
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(max(1, min(int(limit), 500)))
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT *
+                FROM alert_delivery_attempts
+                {where}
+                ORDER BY last_attempted_at DESC, id DESC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+        return [_delivery_attempt_from_row(row) for row in rows]
+
+    def retry_alert_delivery_attempt(self, attempt_id: int, owner_id: str | None = None) -> dict[str, Any]:
+        self._ensure_schema()
+        attempt = self._get_alert_delivery_attempt(attempt_id)
+        event = self._get_alert_event(int(attempt["alert_event_id"]), include_delivery_attempts=False)
+        alert = self.get_alert(int(attempt["alert_id"]), owner_id=owner_id)
+        outcomes = self._deliver_alert_event(
+            alert,
+            event,
+            [str(attempt["channel"])],
+            retry_attempt_id=attempt_id,
+        )
+        return outcomes[0] if outcomes else self._get_alert_delivery_attempt(attempt_id)
+
+    def status(self) -> dict[str, Any]:
+        try:
+            self._ensure_schema()
+            now = self.clock()
+            now_json = _datetime_to_json(now)
+            day_ago_json = _datetime_to_json(now - timedelta(days=1))
+            with self._connect() as connection:
+                schedules = connection.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS total,
+                        SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END) AS enabled,
+                        SUM(CASE WHEN enabled = 1 AND (next_run_at IS NULL OR next_run_at <= ?) THEN 1 ELSE 0 END) AS due
+                    FROM scheduled_scans
+                    """,
+                    (now_json,),
+                ).fetchone()
+                runs = connection.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS total,
+                        SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running,
+                        SUM(CASE WHEN status = 'failure' AND started_at >= ? THEN 1 ELSE 0 END) AS failures_24h
+                    FROM scheduled_scan_runs
+                    """,
+                    (day_ago_json,),
+                ).fetchone()
+                last_run = connection.execute(
+                    """
+                    SELECT id, scheduled_scan_id, status, started_at, finished_at, error_message
+                    FROM scheduled_scan_runs
+                    ORDER BY started_at DESC, id DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
+                alerts = connection.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS total,
+                        SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END) AS enabled
+                    FROM alerts
+                    """
+                ).fetchone()
+                active_events = connection.execute(
+                    "SELECT COUNT(*) AS total FROM alert_events WHERE cleared_at IS NULL"
+                ).fetchone()
+                delivery = connection.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS total,
+                        SUM(CASE WHEN status = 'failure' THEN 1 ELSE 0 END) AS failures
+                    FROM alert_delivery_attempts
+                    """
+                ).fetchone()
+        except Exception as exc:
+            return {
+                "status": "degraded",
+                "error": str(exc),
+            }
+
+        return {
+            "status": "ok",
+            "schedules": {
+                "total": _row_int(schedules, "total"),
+                "enabled": _row_int(schedules, "enabled"),
+                "due": _row_int(schedules, "due"),
+            },
+            "runs": {
+                "total": _row_int(runs, "total"),
+                "running": _row_int(runs, "running"),
+                "failures_24h": _row_int(runs, "failures_24h"),
+                "last": _run_status_row(last_run),
+            },
+            "alerts": {
+                "total": _row_int(alerts, "total"),
+                "enabled": _row_int(alerts, "enabled"),
+                "active_events": _row_int(active_events, "total"),
+            },
+            "delivery": {
+                "enabled": self.alert_delivery is not None,
+                "attempts": _row_int(delivery, "total"),
+                "failures": _row_int(delivery, "failures"),
+            },
+        }
+
     def _ensure_schema(self) -> None:
         if self._schema_ready:
             return
@@ -475,6 +687,7 @@ class AutomationService:
                     """
                     CREATE TABLE IF NOT EXISTS scheduled_scans (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        owner_id TEXT,
                         name TEXT NOT NULL,
                         target_type TEXT NOT NULL,
                         target_json TEXT NOT NULL,
@@ -502,9 +715,11 @@ class AutomationService:
 
                     CREATE TABLE IF NOT EXISTS alerts (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        owner_id TEXT,
                         name TEXT NOT NULL,
                         rule_json TEXT NOT NULL,
                         enabled INTEGER NOT NULL DEFAULT 1,
+                        delivery_channels_json TEXT NOT NULL DEFAULT '[]',
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL
                     );
@@ -529,6 +744,23 @@ class AutomationService:
                         FOREIGN KEY (scan_run_id) REFERENCES scheduled_scan_runs(id) ON DELETE SET NULL
                     );
 
+                    CREATE TABLE IF NOT EXISTS alert_delivery_attempts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        alert_event_id INTEGER NOT NULL,
+                        alert_id INTEGER NOT NULL,
+                        channel TEXT NOT NULL,
+                        destination TEXT NOT NULL DEFAULT '',
+                        status TEXT NOT NULL,
+                        retry_count INTEGER NOT NULL DEFAULT 0,
+                        last_attempted_at TEXT NOT NULL,
+                        error_message TEXT,
+                        response_json TEXT NOT NULL DEFAULT '{}',
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        FOREIGN KEY (alert_event_id) REFERENCES alert_events(id) ON DELETE CASCADE,
+                        FOREIGN KEY (alert_id) REFERENCES alerts(id) ON DELETE CASCADE
+                    );
+
                     CREATE INDEX IF NOT EXISTS idx_scheduled_scans_due
                     ON scheduled_scans (enabled, next_run_at);
 
@@ -544,6 +776,25 @@ class AutomationService:
                     CREATE UNIQUE INDEX IF NOT EXISTS ux_alert_events_open_condition
                     ON alert_events (alert_id, symbol, condition_key)
                     WHERE cleared_at IS NULL;
+
+                    CREATE UNIQUE INDEX IF NOT EXISTS ux_alert_delivery_attempt_event_channel
+                    ON alert_delivery_attempts (alert_event_id, channel);
+
+                    CREATE INDEX IF NOT EXISTS idx_alert_delivery_attempts_status
+                    ON alert_delivery_attempts (status, last_attempted_at);
+                    """
+                )
+                self._ensure_schema_migrations(connection)
+                connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_scheduled_scans_owner_due
+                    ON scheduled_scans (owner_id, enabled, next_run_at)
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_alerts_owner_enabled
+                    ON alerts (owner_id, enabled)
                     """
                 )
             self._schema_ready = True
@@ -553,6 +804,17 @@ class AutomationService:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
+
+    def _ensure_schema_migrations(self, connection: sqlite3.Connection) -> None:
+        _ensure_columns(connection, "scheduled_scans", {"owner_id": "TEXT"})
+        _ensure_columns(
+            connection,
+            "alerts",
+            {
+                "owner_id": "TEXT",
+                "delivery_channels_json": "TEXT NOT NULL DEFAULT '[]'",
+            },
+        )
 
     def _create_run(self, schedule_id: int, started_at: datetime) -> int:
         self._ensure_schema()
@@ -785,7 +1047,9 @@ class AutomationService:
                 event_id = int(cursor.lastrowid)
         except sqlite3.IntegrityError:
             return None
-        return self._get_alert_event(event_id)
+        event = self._get_alert_event(event_id, include_delivery_attempts=False)
+        event["delivery_attempts"] = self._deliver_alert_event(alert, event, alert.get("delivery_channels", []))
+        return event
 
     def _clear_alert_event(self, alert_id: int, symbol: str, condition_key: str) -> None:
         now = self.clock()
@@ -802,12 +1066,177 @@ class AutomationService:
                 (_datetime_to_json(now), alert_id, symbol, condition_key),
             )
 
-    def _get_alert_event(self, event_id: int) -> dict[str, Any]:
+    def _deliver_alert_event(
+        self,
+        alert: Mapping[str, Any],
+        event: Mapping[str, Any],
+        channel_names: Sequence[str],
+        *,
+        retry_attempt_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        channels = normalize_delivery_channels(channel_names)
+        if not channels:
+            return []
+
+        if self.alert_delivery is None:
+            outcomes = [
+                AlertDeliveryOutcome(
+                    channel=channel,
+                    destination="disabled",
+                    status="failure",
+                    response={},
+                    error_message="Alert delivery is disabled.",
+                )
+                for channel in channels
+            ]
+        else:
+            outcomes = self.alert_delivery.deliver(alert, event, channels)
+
+        attempts: list[dict[str, Any]] = []
+        for outcome in outcomes:
+            attempt = self._record_alert_delivery_outcome(
+                alert_event_id=int(event["id"]),
+                alert_id=int(alert["id"]),
+                outcome=outcome,
+                attempt_id=retry_attempt_id,
+            )
+            attempts.append(attempt)
+            if outcome.status != "success":
+                logger.warning(
+                    "Alert delivery failed for event %s via %s: %s",
+                    event["id"],
+                    outcome.channel,
+                    outcome.error_message,
+                )
+        return attempts
+
+    def _record_alert_delivery_outcome(
+        self,
+        *,
+        alert_event_id: int,
+        alert_id: int,
+        outcome: AlertDeliveryOutcome,
+        attempt_id: int | None = None,
+    ) -> dict[str, Any]:
+        now_json = _datetime_to_json(self.clock())
+        if attempt_id is None:
+            try:
+                with self._connect() as connection:
+                    cursor = connection.execute(
+                        """
+                        INSERT INTO alert_delivery_attempts (
+                            alert_event_id,
+                            alert_id,
+                            channel,
+                            destination,
+                            status,
+                            retry_count,
+                            last_attempted_at,
+                            error_message,
+                            response_json,
+                            created_at,
+                            updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            alert_event_id,
+                            alert_id,
+                            outcome.channel,
+                            outcome.destination,
+                            outcome.status,
+                            now_json,
+                            outcome.error_message,
+                            _json_dumps(dict(outcome.response)),
+                            now_json,
+                            now_json,
+                        ),
+                    )
+                    attempt_id = int(cursor.lastrowid)
+            except sqlite3.IntegrityError:
+                with self._connect() as connection:
+                    row = connection.execute(
+                        """
+                        SELECT id
+                        FROM alert_delivery_attempts
+                        WHERE alert_event_id = ? AND channel = ?
+                        """,
+                        (alert_event_id, outcome.channel),
+                    ).fetchone()
+                if row is None:
+                    raise
+                attempt_id = int(row["id"])
+        else:
+            with self._connect() as connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE alert_delivery_attempts
+                    SET destination = ?,
+                        status = ?,
+                        retry_count = retry_count + 1,
+                        last_attempted_at = ?,
+                        error_message = ?,
+                        response_json = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        outcome.destination,
+                        outcome.status,
+                        now_json,
+                        outcome.error_message,
+                        _json_dumps(dict(outcome.response)),
+                        now_json,
+                        attempt_id,
+                    ),
+                )
+                if cursor.rowcount == 0:
+                    raise AlertNotFoundError(f"Alert delivery attempt {attempt_id} was not found.")
+        return self._get_alert_delivery_attempt(attempt_id)
+
+    def _get_alert_event(self, event_id: int, *, include_delivery_attempts: bool = True) -> dict[str, Any]:
         with self._connect() as connection:
             row = connection.execute("SELECT * FROM alert_events WHERE id = ?", (event_id,)).fetchone()
         if row is None:
             raise AlertNotFoundError(f"Alert event {event_id} was not found.")
-        return _event_from_row(row)
+        event = _event_from_row(row)
+        if include_delivery_attempts:
+            self._attach_delivery_attempts([event])
+        return event
+
+    def _get_alert_delivery_attempt(self, attempt_id: int) -> dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM alert_delivery_attempts WHERE id = ?", (attempt_id,)).fetchone()
+        if row is None:
+            raise AlertNotFoundError(f"Alert delivery attempt {attempt_id} was not found.")
+        return _delivery_attempt_from_row(row)
+
+    def _attach_delivery_attempts(self, events: list[dict[str, Any]]) -> None:
+        if not events:
+            return
+        event_ids = [int(event["id"]) for event in events]
+        placeholders = ", ".join("?" for _ in event_ids)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT *
+                FROM alert_delivery_attempts
+                WHERE alert_event_id IN ({placeholders})
+                ORDER BY id ASC
+                """,
+                tuple(event_ids),
+            ).fetchall()
+        attempts_by_event: dict[int, list[dict[str, Any]]] = {event_id: [] for event_id in event_ids}
+        for row in rows:
+            attempt = _delivery_attempt_from_row(row)
+            attempts_by_event[int(attempt["alert_event_id"])].append(attempt)
+        for event in events:
+            event["delivery_attempts"] = attempts_by_event.get(int(event["id"]), [])
+
+    def _normalize_alert_delivery_channels(self, delivery_channels: Sequence[str] | None) -> list[str]:
+        if delivery_channels is None and self.alert_delivery is not None:
+            return list(self.alert_delivery.default_channels)
+        return normalize_delivery_channels(delivery_channels)
 
 
 class AutomationScheduler:
@@ -820,11 +1249,24 @@ class AutomationScheduler:
         self.poll_interval_seconds = poll_interval_seconds
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._state_lock = threading.Lock()
+        self._started_at: datetime | None = None
+        self._stopped_at: datetime | None = None
+        self._last_poll_at: datetime | None = None
+        self._last_success_at: datetime | None = None
+        self._last_error_at: datetime | None = None
+        self._last_error: str | None = None
+        self._total_polls = 0
+        self._total_errors = 0
+        self._total_runs_started = 0
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop_event.clear()
+        with self._state_lock:
+            self._started_at = _utc_now()
+            self._stopped_at = None
         self._thread = threading.Thread(
             target=self._run,
             name="squeeze-scanner-automation-scheduler",
@@ -836,9 +1278,45 @@ class AutomationScheduler:
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=timeout)
+        with self._state_lock:
+            self._stopped_at = _utc_now()
 
     def run_once(self) -> list[dict[str, Any]]:
-        return self.service.run_due_schedules()
+        poll_started = _utc_now()
+        with self._state_lock:
+            self._last_poll_at = poll_started
+            self._total_polls += 1
+        try:
+            runs = self.service.run_due_schedules()
+        except Exception as exc:
+            with self._state_lock:
+                self._last_error_at = _utc_now()
+                self._last_error = str(exc)
+                self._total_errors += 1
+            raise
+        with self._state_lock:
+            self._last_success_at = _utc_now()
+            self._last_error = None
+            self._total_runs_started += len(runs)
+        return runs
+
+    def status(self) -> dict[str, Any]:
+        thread_alive = self._thread is not None and self._thread.is_alive()
+        with self._state_lock:
+            return {
+                "mode": "in_process",
+                "running": thread_alive,
+                "poll_interval_seconds": self.poll_interval_seconds,
+                "started_at": _datetime_to_json(self._started_at),
+                "stopped_at": _datetime_to_json(self._stopped_at),
+                "last_poll_at": _datetime_to_json(self._last_poll_at),
+                "last_success_at": _datetime_to_json(self._last_success_at),
+                "last_error_at": _datetime_to_json(self._last_error_at),
+                "last_error": self._last_error,
+                "total_polls": self._total_polls,
+                "total_errors": self._total_errors,
+                "total_runs_started": self._total_runs_started,
+            }
 
     def _run(self) -> None:
         while not self._stop_event.is_set():
@@ -903,6 +1381,20 @@ def _require_name(value: str, message: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise AutomationError(message)
     return value.strip()
+
+
+def _normalize_owner_id(owner_id: Any) -> str | None:
+    if owner_id is None:
+        return None
+    normalized = str(owner_id).strip()
+    return normalized or None
+
+
+def _ensure_columns(connection: sqlite3.Connection, table: str, columns: Mapping[str, str]) -> None:
+    existing = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+    for column, ddl in columns.items():
+        if column not in existing:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
 def _normalize_target_type(target_type: str) -> str:
@@ -1032,10 +1524,30 @@ def _run_status(result_count: int, errors: Sequence[Mapping[str, str]]) -> str:
     return "success"
 
 
+def _row_int(row: sqlite3.Row | None, key: str) -> int:
+    if row is None or row[key] is None:
+        return 0
+    return int(row[key])
+
+
+def _run_status_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return {
+        "id": int(row["id"]),
+        "scheduled_scan_id": int(row["scheduled_scan_id"]),
+        "status": row["status"],
+        "started_at": row["started_at"],
+        "finished_at": row["finished_at"],
+        "error_message": row["error_message"],
+    }
+
+
 def _schedule_from_row(row: sqlite3.Row) -> dict[str, Any]:
     target = _loads_json(row["target_json"], {})
     return {
         "id": int(row["id"]),
+        "owner_id": row["owner_id"],
         "name": row["name"],
         "target_type": row["target_type"],
         "target": target if isinstance(target, dict) else {},
@@ -1065,11 +1577,14 @@ def _run_from_row(row: sqlite3.Row) -> dict[str, Any]:
 
 def _alert_from_row(row: sqlite3.Row) -> dict[str, Any]:
     rule = _loads_json(row["rule_json"], {})
+    delivery_channels = _loads_json(row["delivery_channels_json"], [])
     return {
         "id": int(row["id"]),
+        "owner_id": row["owner_id"],
         "name": row["name"],
         "rule": rule if isinstance(rule, dict) else {},
         "enabled": bool(row["enabled"]),
+        "delivery_channels": normalize_delivery_channels(delivery_channels if isinstance(delivery_channels, list) else []),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -1093,6 +1608,23 @@ def _event_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "acknowledged_at": row["acknowledged_at"],
         "cleared_at": row["cleared_at"],
         "active": row["cleared_at"] is None,
+    }
+
+
+def _delivery_attempt_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": int(row["id"]),
+        "alert_event_id": int(row["alert_event_id"]),
+        "alert_id": int(row["alert_id"]),
+        "channel": row["channel"],
+        "destination": row["destination"],
+        "status": row["status"],
+        "retry_count": int(row["retry_count"]),
+        "last_attempted_at": row["last_attempted_at"],
+        "error_message": row["error_message"],
+        "response": _loads_json(row["response_json"], {}),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
     }
 
 
